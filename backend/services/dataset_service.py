@@ -35,43 +35,42 @@ logger = logging.getLogger(__name__)
 # ─────────────────────────────────────────────
 # Validators
 # ─────────────────────────────────────────────
-def _detect_reading_columns(df: pd.DataFrame) -> list:
-    non_reading = {"CONS_NO", "FLAG"}
-    candidates  = [c for c in df.columns if c.strip().upper() not in non_reading]
-    if len(candidates) < 26:
-        raise ValueError(
-            f"Need at least 26 reading columns; found {len(candidates)}. "
-            f"Columns: {list(df.columns)}"
-        )
-    return candidates[:26]
+ID_COLS   = {"CONS_NO", "CUSTOMER_ID", "ID", "CUSTOMER", "METER_ID"}
+FLAG_COLS = {"FLAG", "LABEL", "TARGET", "THEFT", "Y"}
 
 
 def validate_dataset(df: pd.DataFrame) -> dict:
-    cols = {c.strip().upper() for c in df.columns}
-    if "CONS_NO" not in cols:
-        raise ValueError("Dataset must contain a 'CONS_NO' column.")
+    """Dynamically detect id column, flag column, and ALL numeric reading columns."""
+    id_col   = next((c for c in df.columns if c.strip().upper() in ID_COLS), None)
+    flag_col = next((c for c in df.columns if c.strip().upper() in FLAG_COLS), None)
 
-    col_map = {c: c.strip().upper() if c.strip().upper() in ("CONS_NO", "FLAG") else c
-               for c in df.columns}
-    df.rename(columns=col_map, inplace=True)
+    reading_cols = []
+    for c in df.columns:
+        if c in (id_col, flag_col):
+            continue
+        coerced = pd.to_numeric(df[c], errors="coerce")
+        if coerced.notna().mean() >= 0.5:
+            df[c] = coerced.fillna(0.0)
+            reading_cols.append(c)
 
-    reading_cols = _detect_reading_columns(df)
-
-    for c in reading_cols:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
+    if len(reading_cols) < 2:
+        raise ValueError(
+            f"Need at least 2 numeric reading columns; found {len(reading_cols)}. "
+            f"Columns: {list(df.columns)}"
+        )
 
     nan_count = int(df[reading_cols].isnull().sum().sum())
     if nan_count > 0:
-        logger.warning("%d NaN reading values — filling with 0", nan_count)
         df[reading_cols] = df[reading_cols].fillna(0)
 
-    has_flag = "FLAG" in df.columns
-
     return {
+        "id_col":       id_col,
+        "flag_col":     flag_col,
         "reading_cols": reading_cols,
-        "has_flag":     has_flag,
+        "has_flag":     flag_col is not None,
         "total":        len(df),
         "nan_count":    nan_count,
+        "seq_len":      len(reading_cols),
     }
 
 
@@ -82,13 +81,15 @@ def load_and_predict(
     filepath:  str,
     filename:  str,
     threshold: float = 0.5,
+    strategy:  str   = "last_n",
 ) -> dict:
     """
-    Load CSV → validate → run real CNN-LSTM predictions → write ALL to SQLite.
-    Returns summary dict.
+    Load CSV → validate → run real model predictions → write ALL to SQLite.
+    Sequence length is detected dynamically and resized to the model length
+    via the chosen strategy. Returns summary dict.
     """
     if not is_model_loaded():
-        raise RuntimeError("No CNN-LSTM model loaded. Upload a model first.")
+        raise RuntimeError("No model loaded. Upload a model first.")
 
     logger.info("Loading dataset: %s", filename)
     df   = pd.read_csv(filepath)
@@ -96,22 +97,19 @@ def load_and_predict(
 
     reading_cols = meta["reading_cols"]
     has_flag     = meta["has_flag"]
+    id_col       = meta["id_col"]
+    flag_col     = meta["flag_col"]
     readings     = df[reading_cols].values.astype(np.float32)
     n            = len(readings)
 
-    logger.info("Computing 59 statistical features for %d customers…", n)
-    stat_feats = pipeline.fit_transform(readings)
-
-    logger.info("Running CNN-LSTM batch prediction on %d customers…", n)
-    probs = predict_batch(
-        readings   = readings,
-        stat_feats = stat_feats if model_state.is_dual_input else None,
-        threshold  = threshold,
+    logger.info(
+        "Predicting %d customers | detected_seq_len=%d | model_seq_len=%s | strategy=%s",
+        n, meta["seq_len"], model_state.seq_len_expected, strategy,
     )
+    from services.model_service import predict_sequences
+    probs = predict_sequences(readings, strategy=strategy, threshold=threshold, fit_scaler=True)
 
-    now       = datetime.utcnow().isoformat()
-    id_col    = "CONS_NO"
-    flag_col  = "FLAG" if has_flag else None
+    now = datetime.utcnow().isoformat()
 
     rows = []
     for i, (_, row) in enumerate(df.iterrows()):
@@ -120,7 +118,7 @@ def load_and_predict(
         conf = prob if pred == 1 else (1.0 - prob)
         risk = round(prob * 100, 2)
         rows.append({
-            "customer_id": str(row[id_col]),
+            "customer_id": str(row[id_col]) if id_col else f"ROW_{i+1}",
             "probability": round(prob, 6),
             "prediction":  pred,
             "confidence":  round(conf, 6),
@@ -136,7 +134,7 @@ def load_and_predict(
     roc_fpr = roc_tpr = pr_prec = pr_rec = conf_mat = None
 
     if has_flag:
-        y_true = df["FLAG"].values.astype(int)
+        y_true = df[flag_col].values.astype(int)
         y_pred = (probs >= threshold).astype(int)
         accuracy      = round(float(accuracy_score(y_true, y_pred)), 6)
         precision_val = round(float(precision_score(y_true, y_pred, zero_division=0)), 6)

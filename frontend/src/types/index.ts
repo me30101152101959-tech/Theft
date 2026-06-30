@@ -44,8 +44,46 @@ export interface ModelInfo {
   total_params_fmt?: string;
   is_dual_input?: boolean;
   stat_input_size?: number;
+  seq_len_expected?: number | null;   // null => variable-length
+  is_variable_length?: boolean;
+  seq_channels?: number;
+  tf_version?: string;
+  keras_version?: string;
   summary?: string;
   architecture?: string;
+}
+
+// ─── Preprocessing strategy ───────────────────────────────────────────────────
+export interface Strategy {
+  value: string;
+  label: string;
+}
+
+// ─── Dataset validation (server-side) ─────────────────────────────────────────
+export interface DatasetValidation {
+  success: boolean;
+  dataset_name: string;
+  n_customers: number;
+  n_reading_cols: number;
+  detected_seq_len: number;
+  missing_values: number;
+  duplicate_customers: number;
+  id_column: string | null;
+  ground_truth_column: string | null;
+  feature_columns: string[];
+  status: string;
+  compatibility: {
+    compatible: boolean;
+    expected_len: number | null;
+    uploaded_len: number;
+    variable_length: boolean;
+    preprocessing_needed: boolean;
+    reason: string;
+    suggested_strategy?: string;
+    selected_strategy?: string;
+  };
+  preview: Record<string, any>[];
+  preview_columns: string[];
 }
 
 // ─── Chart Data ───────────────────────────────────────────────────────────────

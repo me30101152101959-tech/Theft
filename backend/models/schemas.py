@@ -6,9 +6,10 @@ from typing import Optional, Any, List
 
 class ManualPredictionRequest(BaseModel):
     customer_id: str = Field(..., description="Customer identifier")
-    readings: List[float] = Field(..., min_items=26, max_items=26,
-                                   description="26 electricity consumption readings")
+    readings: List[float] = Field(..., min_items=2,
+                                   description="Electricity consumption readings (any length > 1)")
     threshold: float = Field(0.5, ge=0.0, le=1.0)
+    strategy: str = Field("last_n", description="Preprocessing strategy when length != model length")
 
 
 class ThresholdUpdateRequest(BaseModel):

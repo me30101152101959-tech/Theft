@@ -53,23 +53,42 @@ export const predictManual = (payload: {
   customer_id: string;
   readings: number[];
   threshold?: number;
+  strategy?: string;
 }) => api.post('/api/predict/manual', payload);
 
+// ── Predict — strategies & validation ────────────────────────────────────────
+export const getStrategies = () => api.get('/api/predict/strategies');
+
+export const validateDataset = (file: File, strategy = 'last_n') => {
+  const fd = new FormData();
+  fd.append('csv_file', file);
+  fd.append('strategy', strategy);
+  return apiBatch.post('/api/predict/validate-dataset', fd);
+};
+
 // ── Predict — batch ─────────────────────────────────────────────────────────
-export const predictBatchPreview = (file: File, threshold = 0.5) => {
+export const predictBatchPreview = (file: File, threshold = 0.5, strategy = 'last_n') => {
   const fd = new FormData();
   fd.append('csv_file', file);
   fd.append('threshold', String(threshold));
+  fd.append('strategy', strategy);
   return apiBatch.post('/api/predict/batch-preview', fd);
 };
 
-export const predictBatchStore = (file: File, threshold = 0.5, label = 'Batch Upload') => {
+export const predictBatchStore = (file: File, threshold = 0.5, strategy = 'last_n', label = 'Batch Upload') => {
   const fd = new FormData();
   fd.append('csv_file', file);
   fd.append('threshold', String(threshold));
+  fd.append('strategy', strategy);
   fd.append('label', label);
   return apiBatch.post('/api/predict/batch-store', fd);
 };
+
+// ── System status (model verification) ───────────────────────────────────────
+export const getSystemStatus = () => api.get('/api/system/status');
+
+// ── Model status (exclusive-engine verification + last prediction trail) ──────
+export const getModelStatus = () => api.get('/api/model/status');
 
 // ── Predict — threshold update ───────────────────────────────────────────────
 export const updateThreshold = (threshold: number) =>

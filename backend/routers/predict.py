@@ -1,24 +1,26 @@
 """
-Prediction Router — /api/predict/*
-=====================================
-All predictions call model.predict() via model_service.
-Results written to SQLite immediately. No in-memory caching.
+Prediction Router — /api/predict/*  (dynamic, model-driven)
+===========================================================
+Sequence length and statistical-feature count are discovered from the model
+and dataset — nothing hardcoded. The user chooses a preprocessing strategy
+when the dataset length differs from the model length.
 
 Endpoints
 ---------
-  POST /api/predict/manual            — single customer  → manual_predictions table
-  POST /api/predict/batch-preview     — CSV → predict only, no store (UI preview)
-  POST /api/predict/batch-store       — CSV → predict → store in predictions table
-  POST /api/predict/update-threshold  — reclassify latest upload in SQLite
-  GET  /api/predict/shap/{cid}        — gradient-based feature importance
-  GET  /api/predict/history           — recent manual predictions from SQLite
-  GET  /api/predict/template          — blank CSV template download
+  POST /api/predict/manual            — single customer (any length) → SQLite
+  POST /api/predict/validate-dataset  — inspect CSV + model compatibility (no predict)
+  POST /api/predict/batch-preview     — CSV → predict (no store)
+  POST /api/predict/batch-store       — CSV → predict → store in SQLite
+  POST /api/predict/update-threshold  — reclassify latest upload
+  GET  /api/predict/shap/{cid}        — gradient feature importance
+  GET  /api/predict/history           — recent manual predictions
+  GET  /api/predict/strategies        — list available preprocessing strategies
+  GET  /api/predict/template          — blank CSV template (model length)
 """
 from __future__ import annotations
 
 import csv as csv_mod
 import io
-import json
 import logging
 import time
 from datetime import datetime
@@ -31,112 +33,81 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 import database as db
 from models.schemas import ManualPredictionRequest, ThresholdUpdateRequest
-from services import model_service
-from services.feature_service import pipeline
+from services import model_service, preprocessing
+from services.feature_service import scale_sequences
 
 router = APIRouter(prefix="/api/predict", tags=["predict"])
 logger = logging.getLogger(__name__)
 
-READING_LABELS = [
-    "Jan-Y1", "Feb-Y1", "Mar-Y1", "Apr-Y1", "May-Y1", "Jun-Y1",
-    "Jul-Y1", "Aug-Y1", "Sep-Y1", "Oct-Y1", "Nov-Y1", "Dec-Y1",
-    "Jan-Y2", "Feb-Y2", "Mar-Y2", "Apr-Y2", "May-Y2", "Jun-Y2",
-    "Jul-Y2", "Aug-Y2", "Sep-Y2", "Oct-Y2", "Nov-Y2", "Dec-Y2",
-    "W1", "W2",
-]
+ID_COLS   = {"CONS_NO", "CUSTOMER_ID", "ID", "CUSTOMER", "METER_ID"}
+FLAG_COLS = {"FLAG", "LABEL", "TARGET", "THEFT", "Y"}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Shared helpers
+# Helpers
 # ─────────────────────────────────────────────────────────────────────────────
 def _require_model():
     if not model_service.is_model_loaded():
-        raise HTTPException(400, "No CNN-LSTM model loaded. Upload cnnlstm_final.keras first.")
+        raise HTTPException(400, model_service.NO_MODEL_MSG)
 
 
-def _risk_level(risk_score: float) -> str:
-    if risk_score >= 75:
-        return "High"
-    if risk_score >= 40:
-        return "Medium"
-    return "Low"
+def _risk_level(risk: float) -> str:
+    return "High" if risk >= 75 else "Medium" if risk >= 40 else "Low"
 
 
-def _parse_csv_upload(content: bytes) -> tuple[pd.DataFrame, list, bool, bool]:
+def _inspect_csv(content: bytes) -> dict:
     """
-    Parse uploaded CSV bytes.
-    Returns (df, reading_cols, has_cons_no, has_flag).
-    Raises HTTPException on errors.
+    Parse CSV and dynamically detect: id column, flag column, and ALL reading
+    columns (everything numeric that is not id/flag). Returns a rich info dict.
     """
     try:
         df = pd.read_csv(io.StringIO(content.decode("utf-8", errors="replace")))
     except Exception as exc:
         raise HTTPException(400, f"Cannot parse CSV: {exc}")
-
     if df.empty:
         raise HTTPException(400, "CSV file is empty.")
 
-    # Normalise CONS_NO / FLAG column names
-    col_map = {
-        c: c.strip().upper()
-        for c in df.columns
-        if c.strip().upper() in ("CONS_NO", "FLAG")
-    }
-    df = df.rename(columns=col_map)
+    # Identify id / flag columns by name (case-insensitive)
+    id_col = next((c for c in df.columns if c.strip().upper() in ID_COLS), None)
+    flag_col = next((c for c in df.columns if c.strip().upper() in FLAG_COLS), None)
 
-    skip      = {"CONS_NO", "FLAG"}
-    read_cols = [c for c in df.columns if c.strip().upper() not in skip][:26]
+    # Reading columns = everything else, coerced to numeric
+    reading_cols = [c for c in df.columns if c not in (id_col, flag_col)]
+    # keep only columns that are (mostly) numeric
+    numeric_reading_cols = []
+    for c in reading_cols:
+        coerced = pd.to_numeric(df[c], errors="coerce")
+        if coerced.notna().mean() >= 0.5:      # at least half numeric → it's a reading column
+            df[c] = coerced.fillna(0.0)
+            numeric_reading_cols.append(c)
 
-    if len(read_cols) < 26:
+    seq_len = len(numeric_reading_cols)
+    if seq_len < 2:
         raise HTTPException(
             400,
-            f"Need at least 26 reading columns; found {len(read_cols)}. "
-            f"Columns detected: {list(df.columns[:20])}. "
-            "Download the template for the correct format.",
+            f"Could not detect numeric reading columns (found {seq_len}). "
+            f"Provide a CSV with an ID column and ≥2 consumption columns."
         )
 
-    for c in read_cols:
-        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
+    missing = int(pd.to_numeric(df[numeric_reading_cols].stack(), errors="coerce").isna().sum())
+    dup = int(df[id_col].duplicated().sum()) if id_col else 0
 
-    has_cons = "CONS_NO" in df.columns
-    has_flag = "FLAG" in df.columns
-    return df, read_cols, has_cons, has_flag
+    return {
+        "df":            df,
+        "id_col":        id_col,
+        "flag_col":      flag_col,
+        "reading_cols":  numeric_reading_cols,
+        "seq_len":       seq_len,
+        "n_customers":   len(df),
+        "missing":       missing,
+        "duplicates":    dup,
+        "has_flag":      flag_col is not None,
+    }
 
 
-def _run_model(
-    df: pd.DataFrame,
-    read_cols: list,
-    has_cons: bool,
-    has_flag: bool,
-    threshold: float,
-    store_readings: bool = True,
-) -> tuple[list, np.ndarray, float]:
-    """
-    Run model.predict() on df rows.
-    Returns (rows, probs_array, elapsed_seconds).
-    """
-    readings_arr = df[read_cols].values.astype(np.float32)
-    n            = len(readings_arr)
-    id_col       = "CONS_NO" if has_cons else df.columns[0]
-    now          = datetime.utcnow().isoformat()
-
-    stat_feats = None
-    if model_service.state.is_dual_input:
-        logger.info("Computing 59 stat features for %d rows …", n)
-        stat_feats = pipeline.fit_transform(readings_arr)
-
-    logger.info(
-        "model.predict() on %d rows | model=%s | threshold=%.2f",
-        n, model_service.state.model_name, threshold,
-    )
-    t0    = time.time()
-    probs = model_service.predict_batch(
-        readings=readings_arr,
-        stat_feats=stat_feats,
-        threshold=threshold,
-    )
-    elapsed = round(time.time() - t0, 2)
-
+def _build_rows(df, info, probs, threshold, store_readings=True):
+    id_col, flag_col, reading_cols = info["id_col"], info["flag_col"], info["reading_cols"]
+    now = datetime.utcnow().isoformat()
     rows = []
     for i, (_, row) in enumerate(df.iterrows()):
         prob = float(probs[i])
@@ -144,54 +115,107 @@ def _run_model(
         conf = prob if pred == 1 else (1.0 - prob)
         risk = round(prob * 100, 2)
         rows.append({
-            "customer_id": str(row[id_col]),
+            "customer_id": str(row[id_col]) if id_col else f"ROW_{i+1}",
             "probability": round(prob, 6),
             "prediction":  pred,
             "confidence":  round(conf, 6),
             "risk_score":  risk,
             "risk_level":  _risk_level(risk),
             "status":      "Theft" if pred == 1 else "Normal",
-            "flag":        int(row["FLAG"]) if has_flag else None,
-            "readings":    [float(row[c]) for c in read_cols] if store_readings else [],
+            "flag":        int(row[flag_col]) if flag_col else None,
+            "readings":    [float(row[c]) for c in reading_cols] if store_readings else [],
             "predicted_at": now,
         })
-
-    logger.info(
-        "Prediction done: %d rows in %.2fs | theft=%d | normal=%d",
-        n, elapsed,
-        sum(1 for r in rows if r["prediction"] == 1),
-        sum(1 for r in rows if r["prediction"] == 0),
-    )
-    return rows, probs, elapsed
+    return rows
 
 
-def _compute_eval_metrics(df: pd.DataFrame, probs: np.ndarray, threshold: float) -> dict:
+def _eval_metrics(df, info, probs, threshold) -> dict:
     from sklearn.metrics import (
         accuracy_score, precision_score, recall_score,
         f1_score as sk_f1, roc_auc_score,
         confusion_matrix, roc_curve, precision_recall_curve,
     )
-    y_true = df["FLAG"].values.astype(int)
+    y_true = df[info["flag_col"]].values.astype(int)
     y_pred = (probs >= threshold).astype(int)
     try:
         roc_auc = round(float(roc_auc_score(y_true, probs)), 6)
     except Exception:
         roc_auc = 0.0
-    cm        = confusion_matrix(y_true, y_pred)
+    cm = confusion_matrix(y_true, y_pred)
     fpr, tpr, _ = roc_curve(y_true, probs)
-    pp,  rr,  _ = precision_recall_curve(y_true, probs)
+    pp, rr, _ = precision_recall_curve(y_true, probs)
     return {
-        "accuracy":        round(float(accuracy_score(y_true, y_pred)), 6),
-        "precision_val":   round(float(precision_score(y_true, y_pred, zero_division=0)), 6),
-        "recall_val":      round(float(recall_score(y_true, y_pred, zero_division=0)), 6),
-        "f1_score":        round(float(sk_f1(y_true, y_pred, zero_division=0)), 6),
-        "roc_auc":         roc_auc,
+        "accuracy":         round(float(accuracy_score(y_true, y_pred)), 6),
+        "precision_val":    round(float(precision_score(y_true, y_pred, zero_division=0)), 6),
+        "recall_val":       round(float(recall_score(y_true, y_pred, zero_division=0)), 6),
+        "f1_score":         round(float(sk_f1(y_true, y_pred, zero_division=0)), 6),
+        "roc_auc":          roc_auc,
         "confusion_matrix": cm.tolist(),
-        "roc_fpr":         fpr.tolist(),
-        "roc_tpr":         tpr.tolist(),
-        "pr_precision":    pp.tolist(),
-        "pr_recall":       rr.tolist(),
+        "roc_fpr":          fpr.tolist(),
+        "roc_tpr":          tpr.tolist(),
+        "pr_precision":     pp.tolist(),
+        "pr_recall":        rr.tolist(),
     }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GET /api/predict/strategies
+# ─────────────────────────────────────────────────────────────────────────────
+@router.get("/strategies")
+async def list_strategies():
+    return JSONResponse({
+        "strategies": [
+            {"value": s, "label": preprocessing.STRATEGY_LABELS[s]}
+            for s in preprocessing.STRATEGIES
+        ],
+        "default": "last_n",
+    })
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# POST /api/predict/validate-dataset
+# ─────────────────────────────────────────────────────────────────────────────
+@router.post("/validate-dataset")
+async def validate_dataset(
+    csv_file: UploadFile = File(...),
+    strategy: str        = Form("last_n"),
+):
+    """Inspect the CSV and report compatibility with the loaded model. No prediction."""
+    _require_model()
+    content = await csv_file.read()
+    info    = _inspect_csv(content)
+    df      = info["df"]
+
+    compat  = model_service.check_compatibility(info["seq_len"], strategy)
+
+    preview = []
+    for _, row in df.head(20).iterrows():
+        rec = {}
+        if info["id_col"]:
+            rec["customer_id"] = str(row[info["id_col"]])
+        for c in info["reading_cols"][:8]:
+            rec[c] = float(row[c])
+        if info["flag_col"]:
+            rec["FLAG"] = int(row[info["flag_col"]])
+        preview.append(rec)
+
+    return JSONResponse({
+        "success":          True,
+        "dataset_name":     csv_file.filename,
+        "n_customers":      info["n_customers"],
+        "n_reading_cols":   info["seq_len"],
+        "detected_seq_len": info["seq_len"],
+        "missing_values":   info["missing"],
+        "duplicate_customers": info["duplicates"],
+        "id_column":        info["id_col"],
+        "ground_truth_column": info["flag_col"],
+        "feature_columns":  info["reading_cols"][:30],
+        "status":           "Ready" if compat["compatible"] else "Incompatible",
+        "compatibility":    compat,
+        "preview":          preview,
+        "preview_columns":  (["customer_id"] if info["id_col"] else []) + info["reading_cols"][:8]
+                            + (["FLAG"] if info["flag_col"] else []),
+    })
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -199,24 +223,21 @@ def _compute_eval_metrics(df: pd.DataFrame, probs: np.ndarray, threshold: float)
 # ─────────────────────────────────────────────────────────────────────────────
 @router.post("/manual")
 async def manual_predict(req: ManualPredictionRequest):
-    """
-    Single customer prediction.
-    PROOF: model.predict(x) where x.shape == (1, 26, 1)
-    Stores result in SQLite manual_predictions table.
-    """
+    """Single customer of ANY length. Resized to the model length via chosen strategy."""
     _require_model()
-
     readings = np.array(req.readings, dtype=np.float32)
-    if len(readings) != 26:
-        raise HTTPException(400, f"Expected 26 readings, got {len(readings)}.")
+    if len(readings) < 2:
+        raise HTTPException(400, "Provide at least 2 readings.")
 
     try:
-        result = model_service.predict_single(readings, threshold=req.threshold)
+        result = model_service.predict_one(readings, strategy=req.strategy, threshold=req.threshold)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
     except Exception as exc:
-        logger.exception("[manual] model.predict() failed")
-        raise HTTPException(500, f"TensorFlow inference error: {exc}")
+        logger.exception("[manual] prediction failed")
+        raise HTTPException(500, f"Inference error: {exc}")
 
-    now    = datetime.utcnow().isoformat()
+    now = datetime.utcnow().isoformat()
     row_id = db.save_manual_prediction(
         customer_id  = req.customer_id,
         probability  = result["probability"],
@@ -230,20 +251,15 @@ async def manual_predict(req: ManualPredictionRequest):
         model_name   = model_service.state.model_name,
         source       = "manual",
     )
-
     result.update({
         "customer_id":   req.customer_id,
         "readings":      list(req.readings),
         "predicted_at":  now,
         "sqlite_row_id": row_id,
         "stored_in":     "SQLite — manual_predictions",
-        "risk_level":    result.get("risk_level", _risk_level(result["risk_score"])),
     })
-
-    logger.info(
-        "[manual] id=%s | prob=%.4f | status=%s | row_id=%d",
-        req.customer_id, result["probability"], result["status"], row_id,
-    )
+    logger.info("[manual] id=%s | prob=%.4f | %s | row=%d",
+                req.customer_id, result["probability"], result["status"], row_id)
     return JSONResponse({"success": True, "result": result})
 
 
@@ -254,45 +270,49 @@ async def manual_predict(req: ManualPredictionRequest):
 async def batch_preview(
     csv_file:  UploadFile = File(...),
     threshold: float      = Form(0.5),
+    strategy:  str        = Form("last_n"),
 ):
-    """
-    Run batch CNN-LSTM predictions on uploaded CSV.
-    Does NOT store results in SQLite — use batch-store for that.
-    Returns predictions array for the UI table.
-    """
+    """Predict CSV rows (no store). Dynamic length + chosen strategy."""
     _require_model()
     content = await csv_file.read()
-    df, read_cols, has_cons, has_flag = _parse_csv_upload(content)
-    n = len(df)
+    info    = _inspect_csv(content)
+    df      = info["df"]
+    raw     = df[info["reading_cols"]].values.astype(np.float32)
 
-    rows, probs, elapsed = _run_model(df, read_cols, has_cons, has_flag, threshold)
+    t0 = time.time()
+    try:
+        probs = model_service.predict_sequences(raw, strategy=strategy, threshold=threshold, fit_scaler=True)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    elapsed = round(time.time() - t0, 2)
 
-    theft  = sum(1 for r in rows if r["prediction"] == 1)
-    normal = n - theft
-    avg_conf = round(float(np.mean([r["confidence"] for r in rows])), 4)
-    avg_risk = round(float(np.mean([r["risk_score"]  for r in rows])), 4)
+    rows = _build_rows(df, info, probs, threshold, store_readings=False)
+    theft = sum(r["prediction"] for r in rows)
 
     metrics = {}
-    if has_flag:
-        metrics = _compute_eval_metrics(df, probs, threshold)
-        # Only return summary metrics (not large arrays) in the preview
-        metrics = {k: v for k, v in metrics.items()
+    if info["has_flag"]:
+        m = _eval_metrics(df, info, probs, threshold)
+        metrics = {k: v for k, v in m.items()
                    if k not in ("confusion_matrix", "roc_fpr", "roc_tpr", "pr_precision", "pr_recall")}
 
     return JSONResponse({
-        "success":         True,
-        "stored":          False,
-        "total":           n,
-        "theft":           theft,
-        "normal":          normal,
-        "avg_confidence":  avg_conf,
-        "avg_risk":        avg_risk,
-        "elapsed_seconds": elapsed,
-        "has_flag":        has_flag,
-        "metrics":         metrics,
-        "predictions":     rows,
-        "predict_proof":   f"model.predict(x, verbose=0, batch_size=256) x.shape=({n},26,1)",
-        "model_name":      model_service.state.model_name,
+        "success":          True,
+        "stored":           False,
+        "total":            len(rows),
+        "theft":            theft,
+        "normal":           len(rows) - theft,
+        "avg_confidence":   round(float(np.mean([r["confidence"] for r in rows])), 4),
+        "avg_risk":         round(float(np.mean([r["risk_score"] for r in rows])), 4),
+        "elapsed_seconds":  elapsed,
+        "has_flag":         info["has_flag"],
+        "metrics":          metrics,
+        "predictions":      rows,
+        "detected_seq_len": info["seq_len"],
+        "model_seq_len":    model_service.state.seq_len_expected,
+        "strategy_used":    strategy,
+        "predict_proof":    f"model.predict() on {len(rows)} rows | uploaded_len={info['seq_len']} "
+                            f"model_len={model_service.state.seq_len_expected} strategy={strategy}",
+        "model_name":       model_service.state.model_name,
     })
 
 
@@ -303,41 +323,40 @@ async def batch_preview(
 async def batch_store(
     csv_file:  UploadFile = File(...),
     threshold: float      = Form(0.5),
+    strategy:  str        = Form("last_n"),
     label:     str        = Form("Batch Upload"),
 ):
-    """
-    CSV → model.predict() → write ALL results to SQLite predictions table.
-    These results appear immediately on the Customer Predictions page
-    and refresh dashboard statistics.
-    FLAG column (if present) is used ONLY for evaluation, never prediction.
-    """
+    """CSV → predict → store ALL in SQLite (appears on Customer Predictions + dashboard)."""
     _require_model()
     content = await csv_file.read()
-    df, read_cols, has_cons, has_flag = _parse_csv_upload(content)
-    n = len(df)
+    info    = _inspect_csv(content)
+    df      = info["df"]
+    raw     = df[info["reading_cols"]].values.astype(np.float32)
 
-    rows, probs, elapsed = _run_model(df, read_cols, has_cons, has_flag, threshold)
+    t0 = time.time()
+    try:
+        probs = model_service.predict_sequences(raw, strategy=strategy, threshold=threshold, fit_scaler=True)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    elapsed = round(time.time() - t0, 2)
 
-    theft     = sum(1 for r in rows if r["prediction"] == 1)
-    normal    = n - theft
-    avg_conf  = float(np.mean([r["confidence"] for r in rows]))
-    avg_risk  = float(np.mean([r["risk_score"]  for r in rows]))
-    now       = datetime.utcnow().isoformat()
+    rows  = _build_rows(df, info, probs, threshold, store_readings=True)
+    theft = sum(r["prediction"] for r in rows)
+    now   = datetime.utcnow().isoformat()
+    n     = len(rows)
 
-    metrics = {}
-    if has_flag:
-        metrics = _compute_eval_metrics(df, probs, threshold)
+    metrics = _eval_metrics(df, info, probs, threshold) if info["has_flag"] else {}
 
     upload_id = db.save_upload(
         filename         = f"{label} — {csv_file.filename}",
         upload_time      = now,
         total_rows       = n,
         theft_rows       = theft,
-        normal_rows      = normal,
-        avg_confidence   = round(avg_conf, 6),
-        avg_risk         = round(avg_risk, 6),
+        normal_rows      = n - theft,
+        avg_confidence   = round(float(np.mean([r["confidence"] for r in rows])), 6),
+        avg_risk         = round(float(np.mean([r["risk_score"] for r in rows])), 6),
         theft_rate       = round(theft / n, 6) if n else 0.0,
-        has_flag         = has_flag,
+        has_flag         = info["has_flag"],
         threshold        = threshold,
         accuracy         = metrics.get("accuracy"),
         precision_val    = metrics.get("precision_val"),
@@ -351,30 +370,29 @@ async def batch_store(
         confusion_matrix = metrics.get("confusion_matrix"),
     )
     db.save_predictions_bulk(upload_id, rows)
+    logger.info("[batch-store] upload_id=%d | %d rows in %.2fs | theft=%d", upload_id, n, elapsed, theft)
 
-    logger.info(
-        "[batch-store] upload_id=%d | %d rows in %.2fs | theft=%d",
-        upload_id, n, elapsed, theft,
-    )
-
-    pub_metrics = {k: v for k, v in metrics.items()
-                   if k not in ("roc_fpr", "roc_tpr", "pr_precision", "pr_recall", "confusion_matrix")}
+    pub = {k: v for k, v in metrics.items()
+           if k not in ("roc_fpr", "roc_tpr", "pr_precision", "pr_recall", "confusion_matrix")}
 
     return JSONResponse({
-        "success":         True,
-        "upload_id":       upload_id,
-        "stored":          True,
-        "total":           n,
-        "theft":           theft,
-        "normal":          normal,
-        "avg_confidence":  round(avg_conf, 4),
-        "avg_risk":        round(avg_risk, 4),
-        "elapsed_seconds": elapsed,
-        "has_flag":        has_flag,
-        "metrics":         pub_metrics,
-        "predict_proof":   f"model.predict(x, verbose=0, batch_size=256) x.shape=({n},26,1)",
-        "stored_in":       f"SQLite — predictions table (upload_id={upload_id})",
-        "model_name":      model_service.state.model_name,
+        "success":          True,
+        "upload_id":        upload_id,
+        "stored":           True,
+        "total":            n,
+        "theft":            theft,
+        "normal":           n - theft,
+        "avg_confidence":   round(float(np.mean([r["confidence"] for r in rows])), 4),
+        "avg_risk":         round(float(np.mean([r["risk_score"] for r in rows])), 4),
+        "elapsed_seconds":  elapsed,
+        "has_flag":         info["has_flag"],
+        "metrics":          pub,
+        "detected_seq_len": info["seq_len"],
+        "model_seq_len":    model_service.state.seq_len_expected,
+        "strategy_used":    strategy,
+        "predict_proof":    f"model.predict() on {n} rows | strategy={strategy}",
+        "stored_in":        f"SQLite — predictions (upload_id={upload_id})",
+        "model_name":       model_service.state.model_name,
     })
 
 
@@ -383,17 +401,13 @@ async def batch_store(
 # ─────────────────────────────────────────────────────────────────────────────
 @router.post("/update-threshold")
 async def update_threshold(req: ThresholdUpdateRequest):
-    """Re-classify all predictions in the latest SQLite upload at a new threshold."""
     uid = db.get_latest_upload_id()
     if uid is None:
         raise HTTPException(400, "No dataset in SQLite.")
-
     result = db.update_predictions_threshold(uid, req.threshold)
     return JSONResponse({
-        "success":     True,
-        "threshold":   req.threshold,
-        "theft":       result["theft"],
-        "normal":      result["normal"],
+        "success": True, "threshold": req.threshold,
+        "theft": result["theft"], "normal": result["normal"],
         "data_source": "SQLite — predictions reclassified in-place",
     })
 
@@ -403,76 +417,55 @@ async def update_threshold(req: ThresholdUpdateRequest):
 # ─────────────────────────────────────────────────────────────────────────────
 @router.get("/shap/{customer_id}")
 async def get_shap(customer_id: str):
-    """
-    Gradient-based feature importance for one customer.
-    Uses TensorFlow GradientTape (always available — no SHAP library needed).
-    Looks up readings from SQLite predictions or manual_predictions tables.
-    """
+    """Gradient-based feature importance over the model's sequence input."""
     _require_model()
-
-    # Look up customer readings from predictions table first
     uid = db.get_latest_upload_id()
-    row = None
-    if uid:
-        row = db.get_customer_by_id(uid, customer_id)
-
-    # Fall back to manual predictions
+    row = db.get_customer_by_id(uid, customer_id) if uid else None
     if not row:
-        history = db.get_manual_predictions(limit=500)
-        for h in history:
+        for h in db.get_manual_predictions(limit=500):
             if h.get("customer_id") == customer_id:
-                row = {
-                    "id":          customer_id,
-                    "readings":    h["readings"],
-                    "probability": h["probability"],
-                    "status":      h["status"],
-                }
+                row = {"id": customer_id, "readings": h["readings"],
+                       "probability": h["probability"], "status": h["status"]}
                 break
-
     if not row:
         raise HTTPException(404, f"Customer '{customer_id}' not found in SQLite.")
 
     readings_raw = row.get("readings", [])
-    if len(readings_raw) < 26:
+    if len(readings_raw) < 2:
         raise HTTPException(400, "No readings stored for this customer.")
 
-    readings = np.array(readings_raw[:26], dtype=np.float32)
-    r2d      = readings.reshape(1, 26, 1).astype(np.float32)
-    stat     = pipeline.transform(readings.reshape(1, 26)).astype(np.float32)
+    raw = np.array(readings_raw, dtype=np.float32).reshape(1, -1)
+    # Resize to model length, then scale per-row
+    ready = model_service._model_ready(raw, "last_n")
+    T = ready.shape[1]
+    seq_scaled = scale_sequences(ready)
 
     import tensorflow as tf
-    seq_var = tf.Variable(r2d)
-
+    seq_var = tf.Variable(seq_scaled.reshape(1, T, model_service.state.seq_channels).astype(np.float32))
     with tf.GradientTape() as tape:
         tape.watch(seq_var)
         if model_service.state.is_dual_input:
-            stat_t   = tf.constant(stat)
-            pred_out = model_service.state.model(
-                {"sequence_input": seq_var, "stat_input": stat_t},
-                training=False,
-            )
+            stat = model_service._build_stat(ready, fit_scaler=False)
+            out = model_service.state.model(
+                {"sequence_input": seq_var, "stat_input": tf.constant(stat.astype(np.float32))},
+                training=False)
         else:
-            pred_out = model_service.state.model(seq_var, training=False)
-
-    grads = tape.gradient(pred_out, seq_var)
+            out = model_service.state.model(seq_var, training=False)
+    grads = tape.gradient(out, seq_var)
 
     if grads is not None:
-        importance = np.abs(grads.numpy().flatten())
-        total      = importance.sum()
-        importance = (importance / total) if total > 1e-10 else np.ones(26) / 26
+        imp = np.abs(grads.numpy().flatten())
+        s = imp.sum()
+        imp = imp / s if s > 1e-10 else np.ones(T) / T
     else:
-        importance = np.ones(26) / 26
+        imp = np.ones(T) / T
 
-    shap_data = [
-        {
-            "feature":    READING_LABELS[i],
-            "value":      float(readings[i]),
-            "importance": float(importance[i]),
-            "rank":       0,
-        }
-        for i in range(26)
-    ]
-    shap_data.sort(key=lambda x: x["importance"], reverse=True)
+    labels = [f"T{i+1}" for i in range(T)]
+    shap_data = sorted(
+        [{"feature": labels[i], "value": float(ready[0][i]), "importance": float(imp[i]), "rank": 0}
+         for i in range(T)],
+        key=lambda x: x["importance"], reverse=True,
+    )
     for rank, item in enumerate(shap_data):
         item["rank"] = rank + 1
 
@@ -483,7 +476,7 @@ async def get_shap(customer_id: str):
         "method":             "GradientTape integrated gradients",
         "feature_importance": shap_data,
         "top5_features":      [d["feature"] for d in shap_data[:5]],
-        "readings_labels":    READING_LABELS,
+        "readings_labels":    labels,
     })
 
 
@@ -491,17 +484,9 @@ async def get_shap(customer_id: str):
 # GET /api/predict/history
 # ─────────────────────────────────────────────────────────────────────────────
 @router.get("/history")
-async def prediction_history(
-    limit:  int            = Query(100, ge=1, le=1000),
-    source: Optional[str]  = Query(None),
-):
-    """Return recent manual predictions from SQLite."""
+async def prediction_history(limit: int = Query(100, ge=1, le=1000), source: Optional[str] = Query(None)):
     rows = db.get_manual_predictions(limit=limit, source=source)
-    return JSONResponse({
-        "success": True,
-        "count":   len(rows),
-        "history": rows,
-    })
+    return JSONResponse({"success": True, "count": len(rows), "history": rows})
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -509,22 +494,17 @@ async def prediction_history(
 # ─────────────────────────────────────────────────────────────────────────────
 @router.get("/template")
 async def download_template():
-    """Download blank CSV template with correct column headers."""
-    buf    = io.StringIO()
-    writer = csv_mod.writer(buf)
-    writer.writerow(["CONS_NO"] + READING_LABELS + ["FLAG"])
-    writer.writerow(["CUSTOMER_001"] + [str(x * 100) for x in range(1, 27)] + [""])
-    writer.writerow(["CUSTOMER_002"] + ["1200"] * 24 + ["850", "900"] + ["1"])
-    writer.writerow(["CUSTOMER_003"] + ["0", "2400", "0", "2100", "0", "2300",
-                                         "0", "2200", "0", "2500", "0", "2000",
-                                         "2400", "0", "2100", "0", "2300", "0",
-                                         "2200", "0", "2500", "0", "2000", "0",
-                                         "0", "0"] + ["0"])
+    """Blank CSV template sized to the model's expected sequence length (or 26 if variable)."""
+    T = model_service.state.seq_len_expected if model_service.is_model_loaded() else None
+    n = T if T else 26
+    labels = [f"T{i+1}" for i in range(n)]
+    buf = io.StringIO()
+    w = csv_mod.writer(buf)
+    w.writerow(["CONS_NO"] + labels + ["FLAG"])
+    w.writerow(["CUSTOMER_001"] + [str((i + 1) * 100) for i in range(n)] + [""])
     buf.seek(0)
     return StreamingResponse(
         io.BytesIO(buf.getvalue().encode()),
         media_type="text/csv",
-        headers={
-            "Content-Disposition": "attachment; filename=etd_prediction_template.csv"
-        },
+        headers={"Content-Disposition": "attachment; filename=etd_prediction_template.csv"},
     )

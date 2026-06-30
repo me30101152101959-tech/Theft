@@ -145,6 +145,9 @@ async def system_status():
         "total_params":      info.get("total_params"),
         "is_dual_input":     info.get("is_dual_input"),
         "stat_input_size":   info.get("stat_input_size"),
+        "seq_len_expected":  info.get("seq_len_expected"),
+        "is_variable_length": info.get("is_variable_length"),
+        "seq_channels":      info.get("seq_channels"),
         "tf_version":        tf.__version__,
         "prediction_count":  db_module.get_prediction_count(upload_id),
         "manual_count":      db_module.get_manual_prediction_count(),
@@ -152,6 +155,48 @@ async def system_status():
         "load_proof":        "keras.models.load_model(path) — real CNN-LSTM weights",
         "predict_proof":     "model.predict(x, verbose=0, batch_size=256)  x.shape=(N,26,1)",
         "no_mock":           True,
+    })
+
+
+# ── Model status / verification (proves predictions come from the active model) ─
+@app.get("/api/model/status")
+async def model_status():
+    import keras as _keras
+    import tensorflow as tf
+    from services import model_service
+
+    if not model_service.is_model_loaded():
+        return JSONResponse({
+            "model_loaded":  False,
+            "active_model":  None,
+            "engine":        "TensorFlow / Keras",
+            "tf_version":    tf.__version__,
+            "keras_version": getattr(_keras, "__version__", "unknown"),
+            "message":       model_service.NO_MODEL_MSG,
+        }, status_code=200)
+
+    info = model_service.get_model_info()
+    return JSONResponse({
+        "model_loaded":      True,
+        "active_model":      info.get("model_name"),
+        "model_path":        info.get("model_path"),
+        "engine":            "TensorFlow / Keras",
+        "load_method":       "tensorflow.keras.models.load_model(path)",
+        "predict_method":    "model.predict(x)",
+        "tf_version":        tf.__version__,
+        "keras_version":     getattr(_keras, "__version__", "unknown"),
+        "input_shape":       info.get("input_shape"),
+        "output_shape":      info.get("output_shape"),
+        "seq_len_expected":  info.get("seq_len_expected"),
+        "is_variable_length": info.get("is_variable_length"),
+        "is_dual_input":     info.get("is_dual_input"),
+        "stat_input_size":   info.get("stat_input_size"),
+        "total_params":      info.get("total_params"),
+        "total_params_fmt":  info.get("total_params_fmt"),
+        # Verification trail of the most recent model.predict() call:
+        "last_prediction":   model_service.last_prediction or None,
+        "fallback_models":   "none — CNN-LSTM only, no RandomForest/XGBoost/LightGBM/LogReg/mock",
+        "exclusive_engine":  True,
     })
 
 
