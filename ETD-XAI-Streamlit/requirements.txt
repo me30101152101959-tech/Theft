@@ -1,0 +1,16 @@
+# Core app — pinned for a reliable Streamlit Community Cloud build.
+# numpy<2 is required by TensorFlow 2.16.x.
+streamlit>=1.36,<2
+tensorflow-cpu==2.16.1
+numpy==1.26.4
+pandas==2.2.2
+scipy==1.13.1
+scikit-learn==1.5.1
+plotly>=5.22,<6
+openpyxl>=3.1
+reportlab>=4.0
+
+# Optional: SHAP explanations. The app auto-falls back to integrated gradients
+# (real model gradients) if SHAP is not installed, so it is intentionally left
+# out here to keep the cloud build fast and dependency-light. To enable SHAP,
+# add a line:  shap==0.46.0
