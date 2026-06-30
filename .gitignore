@@ -32,6 +32,12 @@ backend/etd_xai.db-wal
 backend/etd_xai.db-shm
 *.sqlite3
 
+# ── Streamlit app: keep bundled model + sample, ignore runtime DB ─
+streamlit_app/etd_xai.db
+streamlit_app/etd_xai.db-wal
+streamlit_app/etd_xai.db-shm
+streamlit_app/uploads/
+
 # ── Logs ────────────────────────────────────────────────
 logs/
 /var/log/etd-xai/
