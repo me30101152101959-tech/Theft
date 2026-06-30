@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+.env
+.venv/
+venv/
+dist/
+
+# Node
+node_modules/
+frontend/dist/
+frontend/.env.local
+
+# Large model files (upload these manually via the UI — don't commit to git)
+backend/uploads/model/*.keras
+backend/uploads/model/*.h5
+backend/uploads/dataset/
+
+# SQLite DB (per-deployment)
+backend/etd_xai.db
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.suo
+*.user
