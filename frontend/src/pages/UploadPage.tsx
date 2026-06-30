@@ -1,0 +1,261 @@
+import React, { useRef, useState } from 'react';
+import { Upload, Cpu, Database, CheckCircle2, AlertTriangle, Loader2, Shield, ChevronRight } from 'lucide-react';
+import { uploadModel, uploadDataset } from '../api/client';
+import type { ModelInfo, DatasetSummary } from '../types';
+import toast from 'react-hot-toast';
+
+interface Props {
+  onReady:      (modelInfo: ModelInfo, summary: DatasetSummary) => void;
+  initialStep?: 'upload_model' | 'upload_dataset' | 'ready';
+}
+
+type Step = 'model' | 'dataset' | 'done';
+
+const UploadPage: React.FC<Props> = ({ onReady, initialStep }) => {
+  const [step, setStep] = useState<Step>('model');
+
+  // If the App already knows model is loaded, skip to dataset step
+  React.useEffect(() => {
+    if (initialStep === 'upload_dataset') setStep('dataset');
+  }, [initialStep]);
+  const [modelInfo, setModelInfo] = useState<ModelInfo | null>(null);
+  const [modelFile, setModelFile] = useState<File | null>(null);
+  const [datasetFile, setDatasetFile] = useState<File | null>(null);
+  const [threshold, setThreshold] = useState(0.5);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+  const [log, setLog] = useState<string[]>([]);
+
+  const modelRef = useRef<HTMLInputElement>(null);
+  const datasetRef = useRef<HTMLInputElement>(null);
+
+  const addLog = (msg: string) => setLog(p => [...p, `[${new Date().toLocaleTimeString()}] ${msg}`]);
+
+  // ── Upload model ──────────────────────────────────────────────
+  const handleModelUpload = async () => {
+    if (!modelFile) return;
+    setLoading(true);
+    setError('');
+    addLog(`Uploading model: ${modelFile.name} (${(modelFile.size / 1024 / 1024).toFixed(2)} MB)...`);
+    try {
+      const res = await uploadModel(modelFile);
+      const info: ModelInfo = res.data.model_info;
+      setModelInfo(info);
+      addLog(`✅ Model loaded: ${info.model_name}`);
+      addLog(`   Architecture: CNN-LSTM | Params: ${info.total_params_fmt}`);
+      addLog(`   Input shape: ${info.input_shape}`);
+      addLog(`   Dual input: ${info.is_dual_input ? `Yes (seq + ${info.stat_input_size} stat features)` : 'No'}`);
+      setStep('dataset');
+      toast.success('CNN-LSTM model loaded successfully!');
+    } catch (e: any) {
+      const msg = e.response?.data?.detail || e.message || 'Upload failed';
+      setError(msg);
+      addLog(`❌ Error: ${msg}`);
+      toast.error(msg);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // ── Upload dataset ─────────────────────────────────────────────
+  const handleDatasetUpload = async () => {
+    if (!datasetFile) return;
+    setLoading(true);
+    setError('');
+    addLog(`Uploading dataset: ${datasetFile.name}...`);
+    addLog(`Threshold: ${threshold}`);
+    try {
+      const res = await uploadDataset(datasetFile, threshold);
+      const summary: DatasetSummary = res.data.summary;
+      addLog(`✅ Dataset processed: ${summary.total.toLocaleString()} customers`);
+      addLog(`   Theft: ${summary.theft.toLocaleString()} | Normal: ${summary.normal.toLocaleString()}`);
+      if (summary.has_flag) {
+        addLog(`   Ground truth labels found (FLAG column)`);
+      }
+      if (summary.avg_confidence != null) {
+        addLog(`   Avg confidence: ${(summary.avg_confidence * 100).toFixed(1)}%`);
+      }
+      addLog(`✅ All predictions stored in SQLite — dashboard ready immediately.`);
+      addLog(`   Model: ${summary.model_used ?? ''} | Results survive server restart.`);
+      toast.success(`${summary.total.toLocaleString()} customers predicted!`);
+      setStep('done');
+      setTimeout(() => onReady(modelInfo!, summary), 1000);
+    } catch (e: any) {
+      const msg = e.response?.data?.detail || e.message || 'Upload failed';
+      setError(msg);
+      addLog(`❌ Error: ${msg}`);
+      toast.error(msg);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // ── Drag & Drop ───────────────────────────────────────────────
+  const handleDrop = (e: React.DragEvent, type: 'model' | 'dataset') => {
+    e.preventDefault();
+    const file = e.dataTransfer.files[0];
+    if (!file) return;
+    if (type === 'model') setModelFile(file);
+    else setDatasetFile(file);
+  };
+
+  const StepBadge = ({ n, label, active, done }: any) => (
+    <div className={`flex items-center gap-2 px-4 py-2 rounded-full text-sm font-semibold
+      ${done ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30' :
+        active ? 'bg-blue-500/20 text-blue-400 border border-blue-500/30' :
+        'bg-slate-700/40 text-slate-500 border border-slate-700'}`}>
+      {done ? <CheckCircle2 className="w-4 h-4" /> : <span className="w-5 h-5 rounded-full bg-current/20 flex items-center justify-center text-xs">{n}</span>}
+      {label}
+    </div>
+  );
+
+  return (
+    <div className="min-h-screen bg-gradient-to-br from-slate-950 via-slate-900 to-blue-950 flex flex-col items-center justify-center p-6">
+      {/* Header */}
+      <div className="text-center mb-8">
+        <div className="flex items-center justify-center gap-3 mb-3">
+          <div className="p-3 bg-blue-600 rounded-2xl shadow-lg shadow-blue-500/30">
+            <Shield className="w-8 h-8 text-white" />
+          </div>
+          <div className="text-left">
+            <h1 className="text-3xl font-black text-white tracking-tight">ETD-XAI Enterprise</h1>
+            <p className="text-blue-400 text-sm font-semibold">Electricity Theft Detection · CNN-LSTM · v1.0</p>
+          </div>
+        </div>
+        <p className="text-slate-400 text-sm mt-2">Upload your trained CNN-LSTM model and customer dataset to begin.</p>
+      </div>
+
+      {/* Steps indicator */}
+      <div className="flex items-center gap-3 mb-8">
+        <StepBadge n="1" label="CNN-LSTM Model" active={step === 'model'} done={step !== 'model'} />
+        <ChevronRight className="w-4 h-4 text-slate-600" />
+        <StepBadge n="2" label="Customer Dataset" active={step === 'dataset'} done={step === 'done'} />
+        <ChevronRight className="w-4 h-4 text-slate-600" />
+        <StepBadge n="3" label="Ready" active={false} done={step === 'done'} />
+      </div>
+
+      <div className="w-full max-w-2xl space-y-4">
+        {/* ── Step 1: Model ── */}
+        <div className={`bg-slate-900 border rounded-2xl p-6 transition-all
+          ${(step as string) === 'model' ? 'border-blue-500/50 shadow-xl shadow-blue-500/10' :
+            (step as string) !== 'model' && modelInfo ? 'border-emerald-500/30' : 'border-slate-800 opacity-60'}`}>
+          <div className="flex items-center gap-3 mb-4">
+            <div className={`p-2 rounded-xl ${modelInfo ? 'bg-emerald-500/20' : 'bg-blue-500/20'}`}>
+              <Cpu className={`w-5 h-5 ${modelInfo ? 'text-emerald-400' : 'text-blue-400'}`} />
+            </div>
+            <div>
+              <h2 className="text-white font-bold">Step 1 — CNN-LSTM Model</h2>
+              <p className="text-slate-400 text-xs">Accepts: .keras or .h5 · Architecture: CNN-LSTM ONLY</p>
+            </div>
+            {modelInfo && <CheckCircle2 className="w-5 h-5 text-emerald-400 ml-auto" />}
+          </div>
+
+          {modelInfo ? (
+            <div className="bg-slate-800/60 rounded-xl p-4 space-y-1 text-xs font-mono">
+              <div className="flex justify-between"><span className="text-slate-400">Model:</span><span className="text-emerald-400 font-bold">{modelInfo.model_name}</span></div>
+              <div className="flex justify-between"><span className="text-slate-400">Architecture:</span><span className="text-blue-400">CNN-LSTM</span></div>
+              <div className="flex justify-between"><span className="text-slate-400">Input Shape:</span><span className="text-white">{modelInfo.input_shape}</span></div>
+              <div className="flex justify-between"><span className="text-slate-400">Output Shape:</span><span className="text-white">{modelInfo.output_shape}</span></div>
+              <div className="flex justify-between"><span className="text-slate-400">Parameters:</span><span className="text-yellow-400">{modelInfo.total_params_fmt}</span></div>
+              <div className="flex justify-between"><span className="text-slate-400">Uploaded:</span><span className="text-white">{new Date(modelInfo.upload_time!).toLocaleTimeString()}</span></div>
+            </div>
+          ) : (
+            <div
+              onDrop={e => handleDrop(e, 'model')}
+              onDragOver={e => e.preventDefault()}
+              onClick={() => modelRef.current?.click()}
+              className="border-2 border-dashed border-slate-700 hover:border-blue-500 rounded-xl p-8 text-center cursor-pointer transition-colors group"
+            >
+              <Upload className="w-8 h-8 text-slate-500 group-hover:text-blue-400 mx-auto mb-2 transition-colors" />
+              <p className="text-slate-300 font-semibold">{modelFile ? modelFile.name : 'Drop your model file here'}</p>
+              <p className="text-slate-500 text-xs mt-1">cnnlstm_final.keras or .h5 — CNN-LSTM models only</p>
+              <input ref={modelRef} type="file" accept=".keras,.h5" className="hidden"
+                onChange={e => setModelFile(e.target.files?.[0] || null)} />
+            </div>
+          )}
+
+          {!modelInfo && step === 'model' && (
+            <button
+              onClick={handleModelUpload}
+              disabled={!modelFile || loading}
+              className="mt-4 w-full py-3 rounded-xl bg-blue-600 hover:bg-blue-500 disabled:opacity-40 disabled:cursor-not-allowed text-white font-bold flex items-center justify-center gap-2 transition-colors"
+            >
+              {loading ? <><Loader2 className="w-4 h-4 animate-spin" />Loading CNN-LSTM Model...</> : <><Cpu className="w-4 h-4" />Load Model</>}
+            </button>
+          )}
+        </div>
+
+        {/* ── Step 2: Dataset ── */}
+        <div className={`bg-slate-900 border rounded-2xl p-6 transition-all
+          ${step === 'dataset' ? 'border-blue-500/50 shadow-xl shadow-blue-500/10' :
+            step === 'done' ? 'border-emerald-500/30' : 'border-slate-800 opacity-50 pointer-events-none'}`}>
+          <div className="flex items-center gap-3 mb-4">
+            <div className={`p-2 rounded-xl ${step === 'done' ? 'bg-emerald-500/20' : 'bg-purple-500/20'}`}>
+              <Database className={`w-5 h-5 ${step === 'done' ? 'text-emerald-400' : 'text-purple-400'}`} />
+            </div>
+            <div>
+              <h2 className="text-white font-bold">Step 2 — Customer Dataset</h2>
+              <p className="text-slate-400 text-xs">Accepts: .csv · Needs CONS_NO + 26 readings · FLAG optional</p>
+            </div>
+            {step === 'done' && <CheckCircle2 className="w-5 h-5 text-emerald-400 ml-auto" />}
+          </div>
+
+          <div
+            onDrop={e => handleDrop(e, 'dataset')}
+            onDragOver={e => e.preventDefault()}
+            onClick={() => step === 'dataset' && datasetRef.current?.click()}
+            className={`border-2 border-dashed rounded-xl p-8 text-center transition-colors
+              ${step === 'dataset' ? 'border-slate-700 hover:border-purple-500 cursor-pointer group' : 'border-slate-800'}`}
+          >
+            <Upload className="w-8 h-8 text-slate-500 group-hover:text-purple-400 mx-auto mb-2 transition-colors" />
+            <p className="text-slate-300 font-semibold">{datasetFile ? datasetFile.name : 'Drop your CSV dataset here'}</p>
+            <p className="text-slate-500 text-xs mt-1">customer_dataset.csv with CONS_NO, 26 readings, optional FLAG</p>
+            <input ref={datasetRef} type="file" accept=".csv" className="hidden"
+              onChange={e => setDatasetFile(e.target.files?.[0] || null)} />
+          </div>
+
+          {step === 'dataset' && (
+            <>
+              <div className="mt-4 flex items-center gap-3">
+                <label className="text-slate-400 text-sm font-medium whitespace-nowrap">Prediction Threshold:</label>
+                <input type="range" min="0" max="1" step="0.01" value={threshold}
+                  onChange={e => setThreshold(Number(e.target.value))}
+                  className="flex-1 accent-blue-500" />
+                <span className="text-blue-400 font-mono font-bold w-12 text-right">{threshold.toFixed(2)}</span>
+              </div>
+
+              <button
+                onClick={handleDatasetUpload}
+                disabled={!datasetFile || loading}
+                className="mt-4 w-full py-3 rounded-xl bg-purple-600 hover:bg-purple-500 disabled:opacity-40 disabled:cursor-not-allowed text-white font-bold flex items-center justify-center gap-2 transition-colors"
+              >
+                {loading ? <><Loader2 className="w-4 h-4 animate-spin" />Running CNN-LSTM Predictions...</> : <><Database className="w-4 h-4" />Upload & Predict</>}
+              </button>
+            </>
+          )}
+        </div>
+
+        {/* Error */}
+        {error && (
+          <div className="bg-red-500/10 border border-red-500/30 rounded-xl p-4 flex items-start gap-3">
+            <AlertTriangle className="w-5 h-5 text-red-400 shrink-0 mt-0.5" />
+            <p className="text-red-300 text-sm">{error}</p>
+          </div>
+        )}
+
+        {/* Terminal log */}
+        {log.length > 0 && (
+          <div className="bg-slate-950 border border-slate-800 rounded-xl p-4 font-mono text-xs max-h-48 overflow-y-auto">
+            {log.map((l, i) => (
+              <div key={i} className={`${l.includes('✅') ? 'text-emerald-400' : l.includes('❌') ? 'text-red-400' : 'text-slate-400'}`}>
+                {l}
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+};
+
+export default UploadPage;
