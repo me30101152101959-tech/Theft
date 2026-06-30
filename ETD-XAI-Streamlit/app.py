@@ -41,9 +41,20 @@ ASSETS = APP_DIR / "assets"
 DEFAULT_MODEL = ASSETS / "cnnlstm_final.keras"
 SAMPLE_DATASET = ASSETS / "sample_dataset.csv"
 LOGO = ASSETS / "logo.png"
-DB_PATH = Path(os.environ.get("DATABASE_PATH", str(APP_DIR / "etd_xai.db")))
-UPLOAD_DIR = APP_DIR / "uploads"
-UPLOAD_DIR.mkdir(exist_ok=True)
+
+# Writable data dir. On Streamlit Community Cloud the repo mount
+# (/mount/src/...) is READ-ONLY, so the SQLite DB and any uploads must live in
+# a writable location (a temp dir by default). Override with ETD_DATA_DIR /
+# DATABASE_PATH to point at a persistent disk in other hosts.
+import tempfile  # noqa: E402
+DATA_DIR = Path(os.environ.get("ETD_DATA_DIR", str(Path(tempfile.gettempdir()) / "etd_xai")))
+try:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+except Exception:
+    DATA_DIR = Path(tempfile.gettempdir())
+DB_PATH = Path(os.environ.get("DATABASE_PATH", str(DATA_DIR / "etd_xai.db")))
+UPLOAD_DIR = DATA_DIR / "uploads"
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 # Exact message shown when no model is available — prediction stops completely.
 NO_MODEL_MSG = "No active CNN-LSTM model loaded."
