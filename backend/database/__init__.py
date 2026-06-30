@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
@@ -22,7 +23,10 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-DB_PATH = Path("etd_xai.db")
+# DB location is configurable (DATABASE_PATH) so deployments can point it at a
+# persistent volume. Defaults to the legacy location for backward compatibility.
+DB_PATH = Path(os.environ.get("DATABASE_PATH", "etd_xai.db"))
+DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Schema

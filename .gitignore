@@ -1,4 +1,4 @@
-# Python
+# ── Python ──────────────────────────────────────────────
 __pycache__/
 *.py[cod]
 *.pyo
@@ -7,25 +7,38 @@ __pycache__/
 .venv/
 venv/
 dist/
+build/
+*.log
+*.tmp
+*.cache
 
-# Node
+# ── Node ────────────────────────────────────────────────
 node_modules/
 frontend/dist/
 frontend/.env.local
 
-# Large model files (upload these manually via the UI — don't commit to git)
+# ── Models & datasets ───────────────────────────────────
+# Ignore uploaded models/datasets by default, but KEEP the bundled active
+# model + sample dataset so the app runs immediately after `git clone`.
 backend/uploads/model/*.keras
 backend/uploads/model/*.h5
-backend/uploads/dataset/
+backend/uploads/dataset/*.csv
+!backend/uploads/model/cnnlstm_final.keras
+!backend/uploads/dataset/datasetsmall (2).csv
 
-# SQLite DB (per-deployment)
+# ── SQLite DB (per-deployment; lives on a persistent volume) ─
 backend/etd_xai.db
+backend/etd_xai.db-wal
+backend/etd_xai.db-shm
+*.sqlite3
 
-# OS
+# ── Logs ────────────────────────────────────────────────
+logs/
+/var/log/etd-xai/
+
+# ── OS / IDE ────────────────────────────────────────────
 .DS_Store
 Thumbs.db
-
-# IDE
 .vscode/
 .idea/
 *.suo

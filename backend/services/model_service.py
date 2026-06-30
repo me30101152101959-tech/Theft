@@ -202,7 +202,23 @@ def auto_load_on_startup() -> bool:
     import database as db
     record = db.get_active_model()
     if not record:
-        logger.info("Startup: no model in SQLite registry — waiting for upload.")
+        # Bootstrap: a fresh clone has an empty registry, but a model file may be
+        # bundled in the repo / mounted volume. Auto-register it so the app works
+        # immediately after cloning with no manual upload.
+        candidates = []
+        if os.environ.get("MODEL_PATH"):
+            candidates.append(os.environ["MODEL_PATH"])
+        candidates += ["uploads/model/cnnlstm_final.keras", "uploads/models/cnnlstm_final.keras"]
+        bootstrap = next((p for p in candidates if Path(p).exists()), None)
+        if bootstrap:
+            try:
+                load_model(bootstrap, Path(bootstrap).name)
+                logger.info("Startup: bootstrapped bundled model from %s", bootstrap)
+                return True
+            except Exception as exc:
+                logger.error("Startup: bootstrap of '%s' failed — %s", bootstrap, exc)
+                return False
+        logger.info("Startup: no registry model and no bundled model — waiting for upload.")
         return False
     path = record["model_path"]
     if not Path(path).exists():

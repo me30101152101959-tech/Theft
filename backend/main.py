@@ -46,7 +46,26 @@ async def lifespan(app: FastAPI):
     from services.model_service import auto_load_on_startup
     model_ok = auto_load_on_startup()
 
-    # 3. Report state
+    # 3. Optional dataset bootstrap — process a bundled dataset on first boot
+    #    so a freshly-cloned/deployed instance shows the dashboard immediately.
+    #    Runs ONLY when the DB has no uploads yet (i.e. truly first boot).
+    if model_ok and not db_module.has_any_upload():
+        boot_ds = os.environ.get("BOOTSTRAP_DATASET_PATH")
+        if not boot_ds:
+            for c in ["uploads/dataset/datasetsmall (2).csv"]:
+                if Path(c).exists():
+                    boot_ds = c
+                    break
+        if boot_ds and Path(boot_ds).exists():
+            try:
+                from services.dataset_service import load_and_predict
+                logger.info("Startup: bootstrapping dataset from %s …", boot_ds)
+                load_and_predict(boot_ds, Path(boot_ds).name, threshold=0.5)
+                logger.info("Startup: dataset bootstrap complete.")
+            except Exception as exc:
+                logger.error("Startup: dataset bootstrap failed — %s", exc)
+
+    # 4. Report state
     has_data     = db_module.has_any_upload()
     pred_count   = db_module.get_prediction_count()
     manual_count = db_module.get_manual_prediction_count()
@@ -75,9 +94,12 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# CORS origins are configurable via CORS_ORIGINS (comma-separated, or "*").
+_cors = os.environ.get("CORS_ORIGINS", "*").strip()
+_origins = ["*"] if _cors == "*" else [o.strip() for o in _cors.split(",") if o.strip()]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

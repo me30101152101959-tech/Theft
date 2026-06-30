@@ -155,5 +155,75 @@ docker-compose up -d --build
 
 **Title:** ETD-XAI Enterprise — Electricity Theft Detection using Deep Learning  
 **Model:** CNN-LSTM (Dual-input: sequence + statistical features)  
-**Dataset:** SGCC-style CSV with 26 reading columns  
+**Dataset:** SGCC-style CSV with any number of reading columns (auto-detected)  
 **Stack:** FastAPI · TensorFlow · React · TypeScript · Plotly · TanStack Table · Docker
+
+---
+
+## 🖥️ Production Deployment (Ubuntu / DigitalOcean — systemd + Nginx + Gunicorn)
+
+A one-shot script provisions a fresh Ubuntu droplet (installs deps, builds the
+frontend, sets up the systemd service and Nginx reverse proxy):
+
+```bash
+sudo REPO=https://github.com/me30101152101959-tech/Theft.git BRANCH=main \
+  bash deploy/deploy.sh
+```
+
+What it configures:
+
+| Component        | Detail                                                            |
+|------------------|-------------------------------------------------------------------|
+| Backend          | Gunicorn + Uvicorn workers via `backend/gunicorn_conf.py`         |
+| Service manager  | `deploy/etd-xai.service` — auto-starts on reboot, `Restart=always`|
+| Reverse proxy    | `deploy/nginx-site.conf` — serves `frontend/dist`, proxies `/api/`|
+| Persistent DB    | `/var/lib/etd-xai/etd_xai.db` (via `DATABASE_PATH`)               |
+| Logs             | `/var/log/etd-xai/{app,error}.log`                                |
+
+Enable HTTPS with Let's Encrypt:
+
+```bash
+sudo certbot --nginx -d your-domain.com
+```
+
+Service management:
+
+```bash
+systemctl status etd-xai      # health
+journalctl -u etd-xai -f      # live logs
+systemctl restart etd-xai     # restart (model + data persist)
+```
+
+### Environment variables
+
+Copy `.env.example` → `.env` and adjust. Key vars: `DATABASE_PATH`, `MODEL_PATH`,
+`DATASET_PATH`, `UPLOAD_FOLDER`, `CORS_ORIGINS`, `MAX_UPLOAD_MB`, `SECRET_KEY`,
+`LOG_LEVEL`, `VITE_API_URL`. All have safe defaults — nothing is required for local dev.
+
+### Persistence & clone-and-run
+
+- The active model (`backend/uploads/model/cnnlstm_final.keras`) is bundled and
+  **auto-loads on startup** — no manual upload needed after a clone or reboot.
+- The SQLite DB persists all predictions, customers, history and metadata. In
+  Docker it lives on the `etd_db` named volume; under systemd at `DATABASE_PATH`.
+- On first boot with an empty DB, a bundled sample dataset is auto-processed so
+  the dashboard is populated immediately (set `BOOTSTRAP_DATASET_PATH` to override).
+
+### Backup & restore
+
+```bash
+sudo bash deploy/backup.sh                 # → /var/backups/etd-xai/etd-xai_backup_*.tar.gz
+sudo bash deploy/restore.sh /var/backups/etd-xai/etd-xai_backup_YYYYMMDD_HHMMSS.tar.gz
+```
+
+Backups capture a consistent SQLite snapshot (`.backup`) plus uploaded models/datasets.
+
+## 🩺 Troubleshooting
+
+| Symptom                              | Fix                                                                 |
+|--------------------------------------|---------------------------------------------------------------------|
+| "No valid CNN-LSTM model is loaded"  | Ensure `MODEL_PATH` points to a real `.keras`; check `journalctl`.  |
+| Dashboard empty after deploy         | Upload a dataset, or set `BOOTSTRAP_DATASET_PATH`.                   |
+| 502 from Nginx                       | Backend down — `systemctl status etd-xai`, check `/var/log/etd-xai`.|
+| Frontend can't reach API             | Set `VITE_API_URL` to the public URL and rebuild (`npm run build`). |
+| Upload too large                     | Raise `client_max_body_size` (Nginx) / `MAX_UPLOAD_MB`.             |

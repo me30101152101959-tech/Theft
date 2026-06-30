@@ -1,0 +1,22 @@
+[Unit]
+Description=ETD-XAI Enterprise FastAPI backend (Gunicorn + Uvicorn workers)
+After=network.target
+
+[Service]
+Type=simple
+User=www-data
+Group=www-data
+WorkingDirectory=/opt/etd-xai/backend
+EnvironmentFile=/opt/etd-xai/.env
+# Persistent paths (override in .env as needed)
+Environment=DATABASE_PATH=/var/lib/etd-xai/etd_xai.db
+Environment=MODEL_PATH=/opt/etd-xai/backend/uploads/model/cnnlstm_final.keras
+ExecStart=/opt/etd-xai/backend/.venv/bin/gunicorn -c gunicorn_conf.py main:app
+Restart=always
+RestartSec=5
+# Logging to /var/log/etd-xai/
+StandardOutput=append:/var/log/etd-xai/app.log
+StandardError=append:/var/log/etd-xai/error.log
+
+[Install]
+WantedBy=multi-user.target
