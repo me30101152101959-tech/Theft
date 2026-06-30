@@ -28,7 +28,9 @@ os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
 logger = logging.getLogger("etd_engine")
 
 # Exact message required when no valid CNN-LSTM model is available.
-NO_MODEL_MSG = "No valid CNN-LSTM model is currently loaded. Please load a valid .keras model."
+# The application STOPS all prediction and shows this — it never falls back to
+# any other model or simulated/random/rule-based output.
+NO_MODEL_MSG = "No active CNN-LSTM model loaded."
 
 # Default bundled model (auto-loaded so the app works immediately on deploy).
 DEFAULT_MODEL = Path(__file__).resolve().parent.parent / "assets" / "cnnlstm_final.keras"

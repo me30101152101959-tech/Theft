@@ -642,8 +642,12 @@ def page_settings():
     info = engine.get_model_info()
     st.markdown("### Active Model")
     if info.get("loaded"):
+        st.markdown(
+            '<span class="badge badge-normal">🟢 Status: Loaded</span>',
+            unsafe_allow_html=True,
+        )
         c = st.columns(3)
-        c[0].metric("Model", info["model_name"])
+        c[0].metric("Active Model Name", info["model_name"])
         c[1].metric("Parameters", info["total_params_fmt"])
         c[2].metric("Architecture", info["architecture"])
         c = st.columns(4)
@@ -651,13 +655,20 @@ def page_settings():
         c[1].metric("Output shape", info["output_shape"])
         c[2].metric("Seq length", info["seq_len_expected"] or "variable")
         c[3].metric("Stat features", info["stat_input_size"])
-        c = st.columns(2)
+        c = st.columns(3)
         c[0].metric("TensorFlow", info["tf_version"])
         c[1].metric("Keras", info["keras_version"])
+        c[2].metric("Upload date", (info.get("upload_time") or "—")[:19].replace("T", " "))
+        st.caption("Load method: `tensorflow.keras.models.load_model()` · "
+                   "Inference: `model.predict()` · Exclusive engine — no fallback models.")
         with st.expander("Model architecture (summary)"):
             st.code(info["summary"], language="text")
     else:
-        st.error(engine.NO_MODEL_MSG)
+        st.markdown(
+            '<span class="badge badge-theft">🔴 Status: Not Loaded</span>',
+            unsafe_allow_html=True,
+        )
+        st.error(engine.NO_MODEL_MSG, icon="🚫")
 
     st.divider()
     st.markdown("### Upload / Activate a New Model")
