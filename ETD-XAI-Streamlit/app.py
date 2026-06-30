@@ -56,6 +56,8 @@ DB_PATH = Path(os.environ.get("DATABASE_PATH", str(DATA_DIR / "etd_xai.db")))
 UPLOAD_DIR = DATA_DIR / "uploads"
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
+APP_VERSION = "2.0.0"
+
 # Exact message shown when no model is available — prediction stops completely.
 NO_MODEL_MSG = "No active CNN-LSTM model loaded."
 
@@ -898,27 +900,94 @@ ss.setdefault("chat", [])
 ss.setdefault("manual_text", "")
 
 
+def _palette() -> dict:
+    """Theme tokens for both modes — single source of truth for all UI colors."""
+    if ss.theme == "dark":
+        return dict(bg="#0b1220", card="#141d2e", card2="#1b2538", text="#e8eefb",
+                    sub="#93a4c0", border="#26344d", grid="rgba(255,255,255,.06)",
+                    accent="#7c3aed", accent2="#2563eb")
+    return dict(bg="#f5f7fb", card="#ffffff", card2="#f1f5f9", text="#0f172a",
+                sub="#5a6b86", border="#e2e8f0", grid="rgba(15,23,42,.06)",
+                accent="#7c3aed", accent2="#2563eb")
+
+
 def inject_css():
-    dark = ss.theme == "dark"
-    bg, card, text, sub, border = (("#0f172a", "#1e293b", "#f1f5f9", "#94a3b8", "#334155") if dark
-                                   else ("#f8fafc", "#ffffff", "#0f172a", "#64748b", "#e2e8f0"))
+    p = _palette()
     st.markdown(f"""<style>
-      .stApp {{ background:{bg}; color:{text}; }}
-      section[data-testid="stSidebar"] {{ background:{card}; border-right:1px solid {border}; }}
-      .kpi {{ background:{card}; border:1px solid {border}; border-radius:14px; padding:18px 20px;
-              box-shadow:0 2px 10px rgba(0,0,0,.08); transition:transform .15s; }}
-      .kpi:hover {{ transform:translateY(-3px); }}
-      .kpi .label {{ color:{sub}; font-size:.78rem; text-transform:uppercase; letter-spacing:.05em; }}
-      .kpi .value {{ color:{text}; font-size:1.9rem; font-weight:700; margin-top:4px; }}
-      .kpi .delta {{ font-size:.78rem; margin-top:2px; }}
-      .badge {{ display:inline-block; padding:6px 16px; border-radius:999px; font-weight:700; }}
-      .badge-theft {{ background:#fee2e2; color:#b91c1c; border:1px solid #fca5a5; }}
-      .badge-normal {{ background:#dcfce7; color:#15803d; border:1px solid #86efac; }}
-      .hero {{ background:linear-gradient(135deg,#1e3a8a 0%,#7c3aed 100%); border-radius:16px;
-               padding:24px 30px; color:#fff; margin-bottom:18px; }}
-      .hero h1 {{ margin:0; font-size:1.7rem; }} .hero p {{ margin:4px 0 0; opacity:.9; }}
-      .pill {{ background:{card}; border:1px solid {border}; border-radius:8px; padding:3px 10px;
-               font-size:.75rem; color:{sub}; }}
+      @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
+      html, body, .stApp, [class*="css"] {{ font-family:'Inter',system-ui,sans-serif; }}
+      .stApp {{ background:{p['bg']}; color:{p['text']}; }}
+      .block-container {{ padding-top:2.2rem; padding-bottom:3.5rem; max-width:1400px; }}
+      section[data-testid="stSidebar"] {{ background:{p['card']}; border-right:1px solid {p['border']}; }}
+      section[data-testid="stSidebar"] .stRadio label {{ font-weight:500; }}
+      h1,h2,h3,h4 {{ color:{p['text']}; letter-spacing:-.01em; }}
+      ::-webkit-scrollbar {{ width:9px; height:9px; }}
+      ::-webkit-scrollbar-thumb {{ background:{p['border']}; border-radius:8px; }}
+
+      /* KPI cards */
+      .kpi {{ position:relative; background:{p['card']}; border:1px solid {p['border']};
+              border-radius:16px; padding:18px 20px; overflow:hidden;
+              box-shadow:0 4px 18px rgba(2,8,23,.10); transition:transform .18s, box-shadow .18s;
+              animation:fade .4s ease both; }}
+      .kpi:hover {{ transform:translateY(-4px); box-shadow:0 10px 26px rgba(2,8,23,.18); }}
+      .kpi::before {{ content:""; position:absolute; left:0; top:0; bottom:0; width:5px;
+                      background:linear-gradient(180deg,var(--a1),var(--a2)); }}
+      .kpi .top {{ display:flex; justify-content:space-between; align-items:center; }}
+      .kpi .label {{ color:{p['sub']}; font-size:.74rem; font-weight:600; text-transform:uppercase;
+                     letter-spacing:.06em; }}
+      .kpi .icon {{ font-size:1.25rem; opacity:.9; }}
+      .kpi .value {{ color:{p['text']}; font-size:1.9rem; font-weight:800; margin-top:6px; line-height:1.1; }}
+      .kpi .delta {{ font-size:.78rem; margin-top:3px; font-weight:600; }}
+
+      /* badges */
+      .badge {{ display:inline-block; padding:7px 18px; border-radius:999px; font-weight:700; font-size:1rem; }}
+      .badge-theft {{ background:rgba(239,68,68,.14); color:#ef4444; border:1px solid rgba(239,68,68,.4); }}
+      .badge-normal {{ background:rgba(34,197,94,.14); color:#22c55e; border:1px solid rgba(34,197,94,.4); }}
+      .badge.pulse {{ animation:pulse 1.4s ease-in-out infinite; }}
+
+      /* hero / executive header */
+      .hero {{ position:relative; background:linear-gradient(120deg,#111c3a 0%,#3b1d7a 55%,#7c3aed 100%);
+               border-radius:20px; padding:28px 34px; color:#fff; margin-bottom:22px; overflow:hidden;
+               box-shadow:0 12px 34px rgba(76,29,149,.35); animation:fade .5s ease both; }}
+      .hero::after {{ content:""; position:absolute; right:-40px; top:-40px; width:220px; height:220px;
+                      background:radial-gradient(circle,rgba(255,255,255,.18),transparent 70%); }}
+      .hero h1 {{ margin:0; font-size:1.85rem; font-weight:800; color:#fff; }}
+      .hero p {{ margin:6px 0 0; opacity:.92; font-size:.98rem; }}
+
+      .pill {{ background:{p['card2']}; border:1px solid {p['border']}; border-radius:8px;
+               padding:4px 11px; font-size:.74rem; color:{p['sub']}; font-weight:500; }}
+      .sb-group {{ color:{p['sub']}; font-size:.7rem; font-weight:700; text-transform:uppercase;
+                   letter-spacing:.08em; margin:10px 2px 2px; }}
+      .mcard {{ background:{p['card2']}; border:1px solid {p['border']}; border-radius:14px;
+                padding:14px 16px; margin-top:8px; }}
+      .mcard .row {{ display:flex; justify-content:space-between; font-size:.8rem; padding:3px 0;
+                     color:{p['sub']}; }} .mcard .row b {{ color:{p['text']}; font-weight:600; }}
+      .dot {{ height:9px; width:9px; border-radius:50%; display:inline-block; margin-right:6px; }}
+
+      /* callouts */
+      .callout {{ border-radius:12px; padding:13px 16px; margin:8px 0; font-weight:500;
+                  border:1px solid; animation:fade .3s ease both; }}
+      .c-ok {{ background:rgba(34,197,94,.10); border-color:rgba(34,197,94,.35); color:#22c55e; }}
+      .c-err {{ background:rgba(239,68,68,.10); border-color:rgba(239,68,68,.35); color:#ef4444; }}
+      .c-warn {{ background:rgba(245,158,11,.10); border-color:rgba(245,158,11,.35); color:#f59e0b; }}
+      .c-info {{ background:rgba(37,99,235,.10); border-color:rgba(37,99,235,.35); color:{p['accent2']}; }}
+
+      /* skeleton + footer + tables */
+      .skel {{ height:96px; border-radius:16px; background:linear-gradient(90deg,{p['card']} 25%,
+               {p['card2']} 37%,{p['card']} 63%); background-size:400% 100%;
+               animation:shimmer 1.3s infinite; }}
+      .footer {{ text-align:center; color:{p['sub']}; font-size:.78rem; margin-top:34px;
+                 padding-top:16px; border-top:1px solid {p['border']}; }}
+      [data-testid="stDataFrame"] {{ border:1px solid {p['border']}; border-radius:12px; }}
+      .stButton>button {{ border-radius:10px; font-weight:600; transition:all .15s; }}
+      .stButton>button:hover {{ transform:translateY(-1px); }}
+      .stTabs [data-baseweb="tab-list"] {{ gap:6px; }}
+      .stTabs [data-baseweb="tab"] {{ border-radius:10px 10px 0 0; font-weight:600; }}
+
+      @keyframes fade {{ from {{ opacity:0; transform:translateY(8px); }} to {{ opacity:1; transform:none; }} }}
+      @keyframes shimmer {{ 0% {{ background-position:100% 0; }} 100% {{ background-position:-100% 0; }} }}
+      @keyframes pulse {{ 0%,100% {{ box-shadow:0 0 0 0 currentColor; opacity:1; }}
+                          50% {{ box-shadow:0 0 0 6px transparent; opacity:.85; }} }}
     </style>""", unsafe_allow_html=True)
 
 
@@ -926,15 +995,70 @@ inject_css()
 TMPL = "plotly_dark" if ss.theme == "dark" else "plotly_white"
 
 
-def kpi(label, value, delta="", color="#3b82f6"):
+def style_fig(fig, height=320, title=None):
+    """Consistent Plotly styling across the whole app."""
+    p = _palette()
+    fig.update_layout(template=TMPL, height=height, title=title,
+                      margin=dict(t=40 if title else 14, b=10, l=10, r=10),
+                      paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                      font=dict(family="Inter", color=p["text"], size=12),
+                      legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0))
+    fig.update_xaxes(gridcolor=p["grid"], zeroline=False)
+    fig.update_yaxes(gridcolor=p["grid"], zeroline=False)
+    return fig
+
+
+def kpi(label, value, delta="", color="#3b82f6", icon="📊"):
+    a1, a2 = (color, color)
     d = f'<div class="delta" style="color:{color}">{delta}</div>' if delta else ""
-    st.markdown(f'<div class="kpi"><div class="label">{label}</div>'
-                f'<div class="value">{value}</div>{d}</div>', unsafe_allow_html=True)
+    st.markdown(
+        f'<div class="kpi" style="--a1:{a1};--a2:{a2}">'
+        f'<div class="top"><span class="label">{label}</span><span class="icon">{icon}</span></div>'
+        f'<div class="value">{value}</div>{d}</div>', unsafe_allow_html=True)
 
 
-def badge(status):
+def badge(status, pulse=False):
     cls = "badge-theft" if status == "Theft" else "badge-normal"
-    return f'<span class="badge {cls}">{"🔴" if status == "Theft" else "🟢"} {status}</span>'
+    pc = " pulse" if pulse else ""
+    return f'<span class="badge {cls}{pc}">{"🔴" if status == "Theft" else "🟢"} {status}</span>'
+
+
+def callout(kind, msg):
+    cls = {"ok": "c-ok", "err": "c-err", "warn": "c-warn", "info": "c-info"}[kind]
+    ic = {"ok": "✅", "err": "🚫", "warn": "⚠️", "info": "ℹ️"}[kind]
+    st.markdown(f'<div class="callout {cls}">{ic}&nbsp; {msg}</div>', unsafe_allow_html=True)
+
+
+def risk_gauge(prob: float, threshold: float = 0.5):
+    """Power-BI-style radial risk gauge for a single prediction."""
+    p = _palette()
+    val = prob * 100
+    color = "#ef4444" if val >= 75 else "#f59e0b" if val >= 40 else "#22c55e"
+    fig = go.Figure(go.Indicator(
+        mode="gauge+number", value=val, number={"suffix": " /100", "font": {"size": 30}},
+        title={"text": "Risk Score", "font": {"size": 14}},
+        gauge={"axis": {"range": [0, 100]}, "bar": {"color": color, "thickness": .28},
+               "bgcolor": "rgba(0,0,0,0)", "borderwidth": 0,
+               "steps": [{"range": [0, 40], "color": "rgba(34,197,94,.18)"},
+                         {"range": [40, 75], "color": "rgba(245,158,11,.18)"},
+                         {"range": [75, 100], "color": "rgba(239,68,68,.18)"}],
+               "threshold": {"line": {"color": p["sub"], "width": 3}, "value": threshold * 100}}))
+    fig.update_layout(template=TMPL, height=240, margin=dict(t=40, b=10, l=20, r=20),
+                      paper_bgcolor="rgba(0,0,0,0)", font=dict(family="Inter", color=p["text"]))
+    return fig
+
+
+def skeleton(cols=4):
+    cs = st.columns(cols)
+    for c in cs:
+        c.markdown('<div class="skel"></div>', unsafe_allow_html=True)
+
+
+def footer():
+    st.markdown(
+        f'<div class="footer">⚡ <b>ETD-XAI Enterprise</b> v{APP_VERSION} · '
+        f'Electricity Theft Detection using Explainable AI · CNN-LSTM (TensorFlow/Keras) · '
+        f'© {datetime.now().year} · MIT License</div>', unsafe_allow_html=True)
 
 
 def hero(title, subtitle):
@@ -943,8 +1067,8 @@ def hero(title, subtitle):
 
 def require_model() -> bool:
     if not is_loaded():
-        st.error(NO_MODEL_MSG, icon="🚫")
-        st.info("Upload a `.keras` model on the **⚙️ Settings** page.")
+        callout("err", f"<b>{NO_MODEL_MSG}</b>")
+        callout("info", "Upload a <code>.keras</code> model on the <b>⚙️ Settings</b> page.")
         return False
     return True
 
@@ -984,66 +1108,63 @@ def page_dashboard():
     uid = latest_upload_id()
     up = get_upload(uid) if uid else None
     c = st.columns(4)
-    with c[0]: kpi("Model Status", "Loaded ✅" if info.get("loaded") else "Not Loaded ⚠️", info.get("name", ""))
-    with c[1]: kpi("Engine", "TF / Keras", f"v{info.get('tf_version', '—')}" if info.get("loaded") else "")
-    with c[2]: kpi("Compute", "GPU" if has_gpu() else "CPU")
-    with c[3]: kpi("Dataset", "Loaded ✅" if up else "None", f"{counts()['predictions']} preds")
+    with c[0]: kpi("Model Status", "Loaded" if info.get("loaded") else "Not Loaded",
+                   info.get("name", ""), "#22c55e" if info.get("loaded") else "#ef4444",
+                   "🧠" if info.get("loaded") else "⚠️")
+    with c[1]: kpi("Engine", "TF / Keras", f"v{info.get('tf_version', '—')}" if info.get("loaded") else "",
+                   "#2563eb", "⚙️")
+    with c[2]: kpi("Compute", "GPU" if has_gpu() else "CPU", "Inference device", "#7c3aed", "🖥️")
+    with c[3]: kpi("Predictions", f"{counts()['predictions']:,}", "stored in SQLite", "#06b6d4", "🗃️")
 
     if not up:
-        st.info("No dataset processed yet — open **📦 Batch Prediction** to score a dataset.", icon="📥")
+        callout("info", "No dataset processed yet — open <b>📦 Batch Prediction</b> to score a dataset.")
         return
 
-    st.markdown("### Prediction Overview")
+    st.markdown("### 📈 Prediction Overview")
     c = st.columns(4)
-    with c[0]: kpi("Total Customers", f"{up['total_rows']:,}")
-    with c[1]: kpi("Normal", f"{up['normal_rows']:,}", "Class 0", "#15803d")
-    with c[2]: kpi("Theft", f"{up['theft_rows']:,}", "Class 1", "#b91c1c")
-    with c[3]: kpi("Theft Rate", f"{(up['theft_rate'] or 0) * 100:.1f}%", color="#f59e0b")
+    with c[0]: kpi("Total Customers", f"{up['total_rows']:,}", "in latest run", "#2563eb", "👥")
+    with c[1]: kpi("Normal", f"{up['normal_rows']:,}", "Class 0", "#22c55e", "🟢")
+    with c[2]: kpi("Theft", f"{up['theft_rows']:,}", "Class 1", "#ef4444", "🔴")
+    with c[3]: kpi("Theft Rate", f"{(up['theft_rate'] or 0) * 100:.1f}%", "of customers", "#f59e0b", "📊")
 
     if up.get("accuracy") is not None:
-        st.markdown("### Evaluation Metrics (vs ground-truth FLAG)")
+        st.markdown("### 🎯 Evaluation Metrics (vs ground-truth FLAG)")
         c = st.columns(5)
-        for col, lbl, key in zip(c, ["Accuracy", "Precision", "Recall", "F1", "ROC-AUC"],
-                                 ["accuracy", "precision_val", "recall_val", "f1_score", "roc_auc"]):
-            with col: kpi(lbl, f"{up[key]:.3f}" if up.get(key) is not None else "—")
+        icons = ["✅", "🎯", "🔁", "⚖️", "📐"]
+        for col, lbl, key, ic in zip(c, ["Accuracy", "Precision", "Recall", "F1", "ROC-AUC"],
+                                     ["accuracy", "precision_val", "recall_val", "f1_score", "roc_auc"], icons):
+            with col: kpi(lbl, f"{up[key]:.3f}" if up.get(key) is not None else "—", "", "#7c3aed", ic)
 
     df = predictions_df(uid)
     if df.empty:
         return
     g = st.columns(2)
     with g[0]:
-        st.markdown("##### Prediction Distribution")
-        pie = df["status"].value_counts().reindex(["Normal", "Theft"]).fillna(0)
-        fig = go.Figure(go.Pie(labels=["Normal", "Theft"], values=pie.values, hole=.55,
-                               marker_colors=["#22c55e", "#ef4444"]))
-        fig.update_layout(template=TMPL, height=320, margin=dict(t=10, b=10))
-        st.plotly_chart(fig, use_container_width=True)
+        fig = go.Figure(go.Pie(labels=["Normal", "Theft"],
+                               values=df["status"].value_counts().reindex(["Normal", "Theft"]).fillna(0).values,
+                               hole=.6, marker_colors=["#22c55e", "#ef4444"],
+                               textfont=dict(size=14)))
+        st.plotly_chart(style_fig(fig, title="Prediction Distribution"), use_container_width=True)
     with g[1]:
-        st.markdown("##### Risk Distribution")
         fig = px.histogram(df, x="risk_score", nbins=25, color="status",
                            color_discrete_map={"Normal": "#22c55e", "Theft": "#ef4444"})
-        fig.update_layout(template=TMPL, height=320, margin=dict(t=10, b=10))
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(style_fig(fig, title="Risk Distribution"), use_container_width=True)
     g = st.columns(2)
     with g[0]:
-        st.markdown("##### Probability Distribution")
         fig = px.histogram(df, x="probability", nbins=30, color="status",
                            color_discrete_map={"Normal": "#22c55e", "Theft": "#ef4444"})
-        fig.update_layout(template=TMPL, height=320, margin=dict(t=10, b=10))
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(style_fig(fig, title="Probability Distribution"), use_container_width=True)
     with g[1]:
         cm = up.get("confusion_matrix")
         if cm:
-            st.markdown("##### Confusion Matrix")
-            fig = px.imshow(cm, text_auto=True, color_continuous_scale="Blues",
+            fig = px.imshow(cm, text_auto=True, color_continuous_scale="Purples",
                             x=["Pred Normal", "Pred Theft"], y=["Actual Normal", "Actual Theft"])
-            fig.update_layout(template=TMPL, height=320, margin=dict(t=10, b=10))
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(style_fig(fig, title="Confusion Matrix"), use_container_width=True)
         else:
-            st.markdown("##### Top 10 Highest-Risk")
+            st.markdown("##### 🔝 Top 10 Highest-Risk")
             st.dataframe(df.head(10)[["customer_id", "risk_score", "status"]],
                         use_container_width=True, hide_index=True)
-    st.markdown("##### Recent Predictions")
+    st.markdown("##### 🕒 Recent Predictions")
     st.dataframe(df.head(20), use_container_width=True, hide_index=True)
 
 
@@ -1073,34 +1194,37 @@ def page_manual():
     if go_btn:
         raw = parse_readings(text)
         if not raw or len(raw) < 2:
-            right.error("Enter at least 2 numeric readings."); return
+            with right:
+                callout("warn", "Enter at least 2 numeric readings.")
+            return
         with right:
-            with st.spinner("Running model.predict()…"):
+            with st.spinner("⚡ Running model.predict()…"):
                 res = predict_one(raw, strat, thr)
             save_manual(customer_id=cid, **{k: res[k] for k in
                 ("probability", "prediction", "confidence", "risk_score", "status")},
                 readings=list(map(float, raw)), threshold=thr, model_name=res["model_name"])
             st.markdown(f"### Result · `{cid}`")
-            st.markdown(badge(res["status"]), unsafe_allow_html=True)
-            cc = st.columns(3)
-            with cc[0]: kpi("Probability", f"{res['probability'] * 100:.1f}%")
-            with cc[1]: kpi("Confidence", f"{res['confidence'] * 100:.1f}%")
-            with cc[2]: kpi("Risk", f"{res['risk_score']:.0f}/100", res["risk_level"],
-                            {"High": "#b91c1c", "Medium": "#f59e0b", "Low": "#15803d"}[res["risk_level"]])
+            st.markdown(badge(res["status"], pulse=True), unsafe_allow_html=True)
+            gcol, kcol = st.columns([1, 1])
+            with gcol:
+                st.plotly_chart(risk_gauge(res["probability"], thr), use_container_width=True)
+            with kcol:
+                kpi("Probability", f"{res['probability'] * 100:.1f}%", "theft likelihood", "#2563eb", "📈")
+                kpi("Confidence", f"{res['confidence'] * 100:.1f}%", res["risk_level"] + " risk",
+                    {"High": "#ef4444", "Medium": "#f59e0b", "Low": "#22c55e"}[res["risk_level"]], "🎯")
             st.caption(f"🕒 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} · model **{res['model_name']}** · "
                        f"{res['uploaded_len']}→{res['model_len']} · strategy `{res['strategy_used']}`")
-            fig = go.Figure(go.Scatter(y=raw, mode="lines+markers", line=dict(color="#3b82f6")))
-            fig.update_layout(template=TMPL, height=240, margin=dict(t=20, b=10),
-                              title="Consumption Sequence", yaxis_title="kWh")
-            st.plotly_chart(fig, use_container_width=True)
+            fig = go.Figure(go.Scatter(y=raw, mode="lines+markers", line=dict(color="#7c3aed", width=2),
+                                       fill="tozeroy", fillcolor="rgba(124,58,237,.12)"))
+            st.plotly_chart(style_fig(fig, height=240, title="Consumption Sequence (kWh)"),
+                            use_container_width=True)
             with st.expander("🧠 Explainable AI", expanded=True):
                 ex = shap_or_ig(raw)
                 if ex:
                     st.caption(f"Method: {ex['method']}")
                     fig = go.Figure(go.Bar(y=ex["timestep_importance"], marker_color="#7c3aed"))
-                    fig.update_layout(template=TMPL, height=220, margin=dict(t=20, b=10),
-                                      title="Per-timestep importance")
-                    st.plotly_chart(fig, use_container_width=True)
+                    st.plotly_chart(style_fig(fig, height=220, title="Per-timestep importance"),
+                                    use_container_width=True)
                 st.markdown("**Risk factors:**")
                 for name, val, dr in risk_factors(raw):
                     st.markdown(f"- {name} · `{val:.3f}` · {dr}")
@@ -1313,26 +1437,60 @@ def page_settings():
 # ═════════════════════════════════════════════════════════════════════════════
 # SECTION 11 — Sidebar navigation + router
 # ═════════════════════════════════════════════════════════════════════════════
+# Grouped navigation — page → (group, function)
+NAV = {
+    "📊 Dashboard": ("Overview", page_dashboard),
+    "🔮 Manual Prediction": ("Predict", page_manual),
+    "📦 Batch Prediction": ("Predict", page_batch),
+    "📜 History": ("Insights", page_history),
+    "📑 Reports": ("Insights", page_reports),
+    "🤖 AI Copilot": ("Insights", page_copilot),
+    "⚙️ Settings": ("System", page_settings),
+}
+GROUP_ORDER = ["Overview", "Predict", "Insights", "System"]
+
 with st.sidebar:
+    cols = st.columns([1, 3])
     if LOGO.exists():
-        st.image(str(LOGO), width=80)
-    st.markdown("## ⚡ ETD-XAI")
-    st.caption("Enterprise v2.0 · CNN-LSTM")
+        cols[0].image(str(LOGO), width=54)
+    cols[1].markdown(f"### ⚡ ETD-XAI\n<span class='pill'>Enterprise v{APP_VERSION}</span>",
+                     unsafe_allow_html=True)
+
     info = model_info()
-    if info.get("loaded"):
-        st.success(f"Model: **{info['name']}**", icon="✅")
-        st.markdown(f"<span class='pill'>Input {info['input_shape']}</span> "
-                    f"<span class='pill'>{info['total_params_fmt']} params</span>", unsafe_allow_html=True)
-    else:
-        st.error(NO_MODEL_MSG, icon="⚠️")
-    PAGES = {
-        "📊 Dashboard": page_dashboard, "🔮 Manual Prediction": page_manual,
-        "📦 Batch Prediction": page_batch, "📜 History": page_history,
-        "📑 Reports": page_reports, "🤖 AI Copilot": page_copilot, "⚙️ Settings": page_settings,
-    }
-    choice = st.radio("Navigation", list(PAGES.keys()), label_visibility="collapsed")
+    online = info.get("loaded")
+    dot = "#22c55e" if online else "#ef4444"
+    st.markdown(
+        f"<div class='mcard'>"
+        f"<div class='row'><span><span class='dot' style='background:{dot}'></span>"
+        f"Model</span><b>{'Loaded' if online else 'Not loaded'}</b></div>"
+        + (f"<div class='row'><span>Name</span><b>{info['name']}</b></div>"
+           f"<div class='row'><span>Architecture</span><b>{info['architecture']}</b></div>"
+           f"<div class='row'><span>Input</span><b>{info['input_shape']}</b></div>"
+           f"<div class='row'><span>Params</span><b>{info['total_params_fmt']}</b></div>"
+           f"<div class='row'><span>TensorFlow</span><b>v{info['tf_version']}</b></div>"
+           f"<div class='row'><span>Compute</span><b>{'GPU' if has_gpu() else 'CPU'}</b></div>"
+           if online else f"<div class='row'><span>{NO_MODEL_MSG}</span><b></b></div>")
+        + "</div>", unsafe_allow_html=True)
+
+    # Grouped radio: build a flat list with group separators rendered above.
+    page_keys = list(NAV.keys())
+    if "nav_choice" not in ss:
+        ss.nav_choice = page_keys[0]
+    st.markdown("<div class='sb-group'>Navigation</div>", unsafe_allow_html=True)
+    for grp in GROUP_ORDER:
+        items = [k for k, (g, _) in NAV.items() if g == grp]
+        if not items:
+            continue
+        st.markdown(f"<div class='sb-group'>{grp}</div>", unsafe_allow_html=True)
+        for k in items:
+            if st.button(k, use_container_width=True, key=f"nav_{k}",
+                         type="primary" if ss.nav_choice == k else "secondary"):
+                ss.nav_choice = k
+                st.rerun()
+
     st.divider()
     cc = counts()
-    st.caption(f"SQLite · {cc['predictions']} preds · {cc['manual']} manual")
+    st.caption(f"🗃️ SQLite · {cc['predictions']} preds · {cc['manual']} manual")
 
-PAGES[choice]()
+NAV[ss.nav_choice][1]()
+footer()
