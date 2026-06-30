@@ -1,20 +1,24 @@
-version: '3.9'
-
 services:
 
-  # ── FastAPI Backend ─────────────────────────────────────────────
+  # ── FastAPI Backend (Uvicorn) ───────────────────────────────────
   backend:
     build:
       context: ./backend
       dockerfile: Dockerfile
     container_name: etd_backend
     restart: unless-stopped
-    volumes:
-      - ./backend/uploads:/app/uploads
-      - ./backend/saved_models:/app/saved_models
+    env_file:
+      - .env
     environment:
       - PYTHONUNBUFFERED=1
       - TF_CPP_MIN_LOG_LEVEL=3
+      # Persist the SQLite DB on a named volume (survives rebuilds/restarts)
+      - DATABASE_PATH=/data/etd_xai.db
+      - MODEL_PATH=/app/uploads/model/cnnlstm_final.keras
+    volumes:
+      - ./backend/uploads:/app/uploads      # models + datasets persist
+      - etd_db:/data                        # SQLite database persists
+      - etd_logs:/var/log/etd-xai           # logs persist
     expose:
       - "8000"
     healthcheck:
@@ -22,9 +26,9 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 40s
+      start_period: 60s
 
-  # ── React Frontend + Nginx ──────────────────────────────────────
+  # ── React Frontend + Nginx reverse proxy ────────────────────────
   frontend:
     build:
       context: ./frontend
@@ -38,4 +42,5 @@ services:
         condition: service_healthy
 
 volumes:
-  uploads_data:
+  etd_db:
+  etd_logs:

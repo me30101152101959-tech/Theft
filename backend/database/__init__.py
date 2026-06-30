@@ -1,51 +1,41 @@
 """
-database  —  SQLite single source of truth
-===========================================
-All prediction results, upload metadata, evaluation metrics, and model
-registration are stored here.  The dashboard NEVER reads Python variables.
-After any backend restart the data is immediately available via SQL.
+ETD-XAI  —  SQLite Persistence Layer
+======================================
+Single source of truth for all predictions, model registry, and upload history.
+After any server restart, dashboard and customer predictions are rebuilt from this DB.
 
-Schema
+Tables
 ------
-  model_registry     — one row per loaded model (most recent = active)
-  dataset_uploads    — one row per CSV upload, includes aggregate stats
-  predictions        — one row per customer, references dataset_uploads.id
-  manual_predictions — one row per /api/predict call
-
-Usage
------
-  import database as db
-  db.init_db()
-  summary = db.get_dashboard_from_db()
+  model_registry    — tracks uploaded CNN-LSTM models
+  dataset_uploads   — one row per CSV upload (aggregate stats + metrics)
+  predictions       — one row per customer per upload
+  manual_predictions — one row per manual / batch-predict-store call
 """
 from __future__ import annotations
 
 import json
 import logging
+import os
 import sqlite3
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Optional
 
-DB_PATH = Path("etd_xai.db")
-logger  = logging.getLogger(__name__)
+logger = logging.getLogger(__name__)
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Connection
-# ─────────────────────────────────────────────────────────────────────────────
-def get_db() -> sqlite3.Connection:
-    """Return a SQLite connection with row_factory set to sqlite3.Row."""
-    conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA foreign_keys=ON")
-    return conn
-
+# DB location is configurable (DATABASE_PATH) so deployments can point it at a
+# persistent volume. Defaults to the legacy location for backward compatibility.
+DB_PATH = Path(os.environ.get("DATABASE_PATH", "etd_xai.db"))
+DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Schema  (idempotent — safe to call on every startup)
+# Schema
 # ─────────────────────────────────────────────────────────────────────────────
 _DDL = """
+PRAGMA journal_mode=WAL;
+PRAGMA synchronous=NORMAL;
+PRAGMA foreign_keys=ON;
+
 CREATE TABLE IF NOT EXISTS model_registry (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     model_name      TEXT    NOT NULL,
@@ -59,26 +49,26 @@ CREATE TABLE IF NOT EXISTS model_registry (
 );
 
 CREATE TABLE IF NOT EXISTS dataset_uploads (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    filename        TEXT    NOT NULL,
-    upload_time     TEXT    NOT NULL,
-    total_rows      INTEGER NOT NULL DEFAULT 0,
-    theft_rows      INTEGER NOT NULL DEFAULT 0,
-    normal_rows     INTEGER NOT NULL DEFAULT 0,
-    avg_confidence  REAL,
-    avg_risk        REAL,
-    theft_rate      REAL,
-    has_flag        INTEGER DEFAULT 0,
-    threshold       REAL    DEFAULT 0.5,
-    accuracy        REAL,
-    precision_val   REAL,
-    recall_val      REAL,
-    f1_score        REAL,
-    roc_auc         REAL,
-    roc_fpr         TEXT,
-    roc_tpr         TEXT,
-    pr_precision    TEXT,
-    pr_recall       TEXT,
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    filename       TEXT    NOT NULL,
+    upload_time    TEXT    NOT NULL,
+    total_rows     INTEGER NOT NULL DEFAULT 0,
+    theft_rows     INTEGER NOT NULL DEFAULT 0,
+    normal_rows    INTEGER NOT NULL DEFAULT 0,
+    avg_confidence REAL,
+    avg_risk       REAL,
+    theft_rate     REAL,
+    has_flag       INTEGER DEFAULT 0,
+    threshold      REAL    DEFAULT 0.5,
+    accuracy       REAL,
+    precision_val  REAL,
+    recall_val     REAL,
+    f1_score       REAL,
+    roc_auc        REAL,
+    roc_fpr        TEXT,
+    roc_tpr        TEXT,
+    pr_precision   TEXT,
+    pr_recall      TEXT,
     confusion_matrix TEXT
 );
 
@@ -97,9 +87,10 @@ CREATE TABLE IF NOT EXISTS predictions (
     FOREIGN KEY (upload_id) REFERENCES dataset_uploads(id)
 );
 
-CREATE INDEX IF NOT EXISTS idx_pred_upload ON predictions(upload_id);
-CREATE INDEX IF NOT EXISTS idx_pred_status ON predictions(status);
-CREATE INDEX IF NOT EXISTS idx_pred_cid    ON predictions(customer_id);
+CREATE INDEX IF NOT EXISTS idx_pred_upload  ON predictions(upload_id);
+CREATE INDEX IF NOT EXISTS idx_pred_cust    ON predictions(customer_id);
+CREATE INDEX IF NOT EXISTS idx_pred_status  ON predictions(status);
+CREATE INDEX IF NOT EXISTS idx_pred_risk    ON predictions(risk_score);
 
 CREATE TABLE IF NOT EXISTS manual_predictions (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -112,16 +103,39 @@ CREATE TABLE IF NOT EXISTS manual_predictions (
     readings     TEXT    NOT NULL,
     predicted_at TEXT    NOT NULL,
     threshold    REAL    DEFAULT 0.5,
-    model_name   TEXT
+    model_name   TEXT,
+    source       TEXT    DEFAULT 'manual'
 );
 """
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Connection helpers
+# ─────────────────────────────────────────────────────────────────────────────
+def get_db() -> sqlite3.Connection:
+    conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+@contextmanager
+def _conn():
+    conn = get_db()
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 def init_db() -> None:
-    """Create all tables.  Safe to call multiple times."""
-    with get_db() as conn:
+    """Create all tables. Safe to call multiple times."""
+    with _conn() as conn:
         conn.executescript(_DDL)
-    logger.info("SQLite ready: %s", DB_PATH.resolve())
+    logger.info("SQLite DB initialised at %s", DB_PATH.resolve())
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -131,37 +145,35 @@ def register_model(
     model_name: str,
     model_path: str,
     loaded_at: str,
-    input_shape: str,
-    output_shape: str,
-    total_params: int,
-    is_dual_input: bool,
-    stat_input_size: int,
+    input_shape: str = "",
+    output_shape: str = "",
+    total_params: int = 0,
+    is_dual_input: bool = False,
+    stat_input_size: int = 0,
 ) -> int:
-    with get_db() as conn:
+    with _conn() as conn:
         cur = conn.execute(
-            """
-            INSERT INTO model_registry
-              (model_name, model_path, loaded_at, input_shape, output_shape,
-               total_params, is_dual_input, stat_input_size)
-            VALUES (?,?,?,?,?,?,?,?)
-            """,
-            (model_name, model_path, loaded_at,
-             input_shape, output_shape,
+            """INSERT INTO model_registry
+               (model_name,model_path,loaded_at,input_shape,output_shape,
+                total_params,is_dual_input,stat_input_size)
+               VALUES (?,?,?,?,?,?,?,?)""",
+            (model_name, model_path, loaded_at, input_shape, output_shape,
              total_params, int(is_dual_input), stat_input_size),
         )
         return cur.lastrowid
 
 
 def get_active_model() -> Optional[dict]:
-    """Most-recently registered model, or None."""
-    row = get_db().execute(
-        "SELECT * FROM model_registry ORDER BY id DESC LIMIT 1"
-    ).fetchone()
+    """Return the most-recently registered model (latest row)."""
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT * FROM model_registry ORDER BY id DESC LIMIT 1"
+        ).fetchone()
     return dict(row) if row else None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Upload + predictions
+# Dataset uploads
 # ─────────────────────────────────────────────────────────────────────────────
 def save_upload(
     filename: str,
@@ -174,127 +186,134 @@ def save_upload(
     theft_rate: float,
     has_flag: bool,
     threshold: float,
-    accuracy: Optional[float],
-    precision_val: Optional[float],
-    recall_val: Optional[float],
-    f1_score: Optional[float],
-    roc_auc: Optional[float],
-    roc_fpr: Optional[list],
-    roc_tpr: Optional[list],
-    pr_precision: Optional[list],
-    pr_recall: Optional[list],
-    confusion_matrix: Optional[list],
+    accuracy=None,
+    precision_val=None,
+    recall_val=None,
+    f1_score=None,
+    roc_auc=None,
+    roc_fpr=None,
+    roc_tpr=None,
+    pr_precision=None,
+    pr_recall=None,
+    confusion_matrix=None,
 ) -> int:
-    with get_db() as conn:
+    def _enc(x):
+        return json.dumps(x) if x is not None else None
+
+    with _conn() as conn:
         cur = conn.execute(
-            """
-            INSERT INTO dataset_uploads
-              (filename, upload_time, total_rows, theft_rows, normal_rows,
-               avg_confidence, avg_risk, theft_rate, has_flag, threshold,
-               accuracy, precision_val, recall_val, f1_score, roc_auc,
-               roc_fpr, roc_tpr, pr_precision, pr_recall, confusion_matrix)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-            """,
-            (
-                filename, upload_time, total_rows, theft_rows, normal_rows,
-                avg_confidence, avg_risk, theft_rate, int(has_flag), threshold,
-                accuracy, precision_val, recall_val, f1_score, roc_auc,
-                json.dumps(roc_fpr)         if roc_fpr         else None,
-                json.dumps(roc_tpr)         if roc_tpr         else None,
-                json.dumps(pr_precision)    if pr_precision     else None,
-                json.dumps(pr_recall)       if pr_recall        else None,
-                json.dumps(confusion_matrix)if confusion_matrix else None,
-            ),
+            """INSERT INTO dataset_uploads
+               (filename,upload_time,total_rows,theft_rows,normal_rows,
+                avg_confidence,avg_risk,theft_rate,has_flag,threshold,
+                accuracy,precision_val,recall_val,f1_score,roc_auc,
+                roc_fpr,roc_tpr,pr_precision,pr_recall,confusion_matrix)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (filename, upload_time, total_rows, theft_rows, normal_rows,
+             avg_confidence, avg_risk, theft_rate, int(has_flag), threshold,
+             accuracy, precision_val, recall_val, f1_score, roc_auc,
+             _enc(roc_fpr), _enc(roc_tpr), _enc(pr_precision), _enc(pr_recall),
+             _enc(confusion_matrix)),
         )
-        return cur.lastrowid
+        upload_id = cur.lastrowid
+
+    logger.info(
+        "SQLite: saved upload id=%d  file=%s  rows=%d",
+        upload_id, filename, total_rows,
+    )
+    return upload_id
 
 
-def save_predictions_bulk(upload_id: int, rows: list) -> None:
-    """Bulk-insert prediction rows into SQLite."""
-    with get_db() as conn:
-        conn.executemany(
-            """
-            INSERT INTO predictions
-              (upload_id, customer_id, probability, prediction, confidence,
-               risk_score, status, flag, readings, predicted_at)
-            VALUES (?,?,?,?,?,?,?,?,?,?)
-            """,
-            [
-                (
-                    upload_id,
-                    r["customer_id"],
-                    r["probability"],
-                    r["prediction"],
-                    r["confidence"],
-                    r["risk_score"],
-                    r["status"],
-                    r.get("flag"),
-                    json.dumps(r["readings"]) if r.get("readings") else None,
-                    r["predicted_at"],
-                )
-                for r in rows
-            ],
-        )
-
-
-def save_manual_prediction(
-    customer_id: str,
-    probability: float,
-    prediction: int,
-    confidence: float,
-    risk_score: float,
-    status: str,
-    readings: list,
-    predicted_at: str,
-    threshold: float,
-    model_name: str,
-) -> int:
-    with get_db() as conn:
-        cur = conn.execute(
-            """
-            INSERT INTO manual_predictions
-              (customer_id, probability, prediction, confidence, risk_score,
-               status, readings, predicted_at, threshold, model_name)
-            VALUES (?,?,?,?,?,?,?,?,?,?)
-            """,
-            (
-                customer_id, probability, prediction, confidence, risk_score,
-                status, json.dumps(readings), predicted_at, threshold, model_name,
-            ),
-        )
-        return cur.lastrowid
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Dashboard helpers  (ALL reads go through here — never Python variables)
-# ─────────────────────────────────────────────────────────────────────────────
 def get_latest_upload_id() -> Optional[int]:
-    row = get_db().execute(
-        "SELECT id FROM dataset_uploads ORDER BY id DESC LIMIT 1"
-    ).fetchone()
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT id FROM dataset_uploads ORDER BY id DESC LIMIT 1"
+        ).fetchone()
     return row["id"] if row else None
 
 
 def get_upload_summary(upload_id: int) -> Optional[dict]:
-    row = get_db().execute(
-        "SELECT * FROM dataset_uploads WHERE id = ?", (upload_id,)
-    ).fetchone()
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT * FROM dataset_uploads WHERE id=?", (upload_id,)
+        ).fetchone()
     if not row:
         return None
+
+    def _dec(x):
+        return json.loads(x) if x else None
+
     d = dict(row)
-    for key in ("roc_fpr", "roc_tpr", "pr_precision", "pr_recall", "confusion_matrix"):
-        if d.get(key):
-            d[key] = json.loads(d[key])
+    d["roc_fpr"]         = _dec(d.get("roc_fpr"))
+    d["roc_tpr"]         = _dec(d.get("roc_tpr"))
+    d["pr_precision"]    = _dec(d.get("pr_precision"))
+    d["pr_recall"]       = _dec(d.get("pr_recall"))
+    d["confusion_matrix"]= _dec(d.get("confusion_matrix"))
     return d
 
 
-def get_dashboard_from_db() -> Optional[dict]:
-    """Complete dashboard row from SQLite, or None when nothing uploaded."""
-    uid = get_latest_upload_id()
-    return get_upload_summary(uid) if uid else None
+def has_any_upload() -> bool:
+    with get_db() as conn:
+        row = conn.execute("SELECT id FROM dataset_uploads LIMIT 1").fetchone()
+    return row is not None
 
 
-def get_customers_from_db(
+def get_all_uploads() -> list:
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT id,filename,upload_time,total_rows,theft_rows,normal_rows,theft_rate,threshold "
+            "FROM dataset_uploads ORDER BY id DESC"
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Predictions (bulk)
+# ─────────────────────────────────────────────────────────────────────────────
+def save_predictions_bulk(upload_id: int, rows: list[dict]) -> None:
+    """
+    Bulk-insert N prediction rows.  Each dict must have:
+      customer_id, probability, prediction, confidence, risk_score,
+      status, flag (or None), readings (list), predicted_at.
+    """
+    records = [
+        (
+            upload_id,
+            r["customer_id"],
+            r["probability"],
+            r["prediction"],
+            r["confidence"],
+            r["risk_score"],
+            r["status"],
+            r.get("flag"),
+            json.dumps(r.get("readings", [])),
+            r["predicted_at"],
+        )
+        for r in rows
+    ]
+    with _conn() as conn:
+        conn.executemany(
+            """INSERT INTO predictions
+               (upload_id,customer_id,probability,prediction,confidence,
+                risk_score,status,flag,readings,predicted_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?)""",
+            records,
+        )
+    logger.info("SQLite: bulk-inserted %d predictions for upload_id=%d", len(records), upload_id)
+
+
+def get_prediction_count(upload_id: Optional[int] = None) -> int:
+    with get_db() as conn:
+        if upload_id is not None:
+            row = conn.execute(
+                "SELECT COUNT(*) AS c FROM predictions WHERE upload_id=?",
+                (upload_id,),
+            ).fetchone()
+        else:
+            row = conn.execute("SELECT COUNT(*) AS c FROM predictions").fetchone()
+    return row["c"] if row else 0
+
+
+def get_customers_paginated(
     upload_id: int,
     page: int = 1,
     page_size: int = 50,
@@ -303,132 +322,298 @@ def get_customers_from_db(
     sort_by: str = "risk_score",
     sort_dir: str = "desc",
 ) -> dict:
-    allowed = {"risk_score", "probability", "confidence", "customer_id", "status", "prediction"}
-    if sort_by not in allowed:
+    allowed_sort = {"risk_score", "probability", "confidence", "customer_id", "status", "predicted_at"}
+    if sort_by not in allowed_sort:
         sort_by = "risk_score"
-    order = "DESC" if sort_dir == "desc" else "ASC"
+    order = "DESC" if sort_dir.lower() == "desc" else "ASC"
 
-    where_parts = ["upload_id = ?"]
+    conditions = ["upload_id = ?"]
     params: list = [upload_id]
+
     if search:
-        where_parts.append("customer_id LIKE ?")
+        conditions.append("customer_id LIKE ?")
         params.append(f"%{search}%")
     if status_filter in ("Theft", "Normal"):
-        where_parts.append("status = ?")
+        conditions.append("status = ?")
         params.append(status_filter)
 
-    where_sql = " AND ".join(where_parts)
+    where = " AND ".join(conditions)
 
-    count_row = get_db().execute(
-        f"SELECT COUNT(*) AS n FROM predictions WHERE {where_sql}", params
-    ).fetchone()
-    total = count_row["n"] if count_row else 0
+    with get_db() as conn:
+        total = conn.execute(
+            f"SELECT COUNT(*) AS c FROM predictions WHERE {where}", params
+        ).fetchone()["c"]
 
-    offset = (page - 1) * page_size
-    rows = get_db().execute(
-        f"""
-        SELECT customer_id, probability, prediction, confidence,
-               risk_score, status, flag
-        FROM predictions
-        WHERE {where_sql}
-        ORDER BY {sort_by} {order}
-        LIMIT ? OFFSET ?
-        """,
-        params + [page_size, offset],
-    ).fetchall()
+        offset = (page - 1) * page_size
+        rows = conn.execute(
+            f"""SELECT customer_id,probability,prediction,confidence,
+                       risk_score,status,flag,readings,predicted_at
+                FROM predictions
+                WHERE {where}
+                ORDER BY {sort_by} {order}
+                LIMIT ? OFFSET ?""",
+            params + [page_size, offset],
+        ).fetchall()
+
+    data = []
+    for r in rows:
+        d = dict(r)
+        d["id"] = d.pop("customer_id")
+        try:
+            d["readings"] = json.loads(d["readings"]) if d["readings"] else []
+        except Exception:
+            d["readings"] = []
+        data.append(d)
 
     return {
-        "data":        [dict(r) for r in rows],
-        "total":       total,
-        "page":        page,
-        "page_size":   page_size,
+        "data": data,
+        "total": total,
+        "page": page,
+        "page_size": page_size,
         "total_pages": max(1, (total + page_size - 1) // page_size),
     }
 
 
-def get_prediction_count() -> int:
-    row = get_db().execute("SELECT COUNT(*) AS n FROM predictions").fetchone()
-    return row["n"] if row else 0
+def get_customer_by_id(upload_id: int, customer_id: str) -> Optional[dict]:
+    with get_db() as conn:
+        row = conn.execute(
+            """SELECT customer_id,probability,prediction,confidence,
+                      risk_score,status,flag,readings,predicted_at
+               FROM predictions
+               WHERE upload_id=? AND customer_id=? LIMIT 1""",
+            (upload_id, customer_id),
+        ).fetchone()
+    if not row:
+        return None
+    d = dict(row)
+    d["id"] = d.pop("customer_id")
+    try:
+        d["readings"] = json.loads(d["readings"]) if d["readings"] else []
+    except Exception:
+        d["readings"] = []
+    return d
 
 
-def has_any_upload() -> bool:
-    row = get_db().execute("SELECT id FROM dataset_uploads LIMIT 1").fetchone()
-    return row is not None
+def get_all_customers_for_export(upload_id: int) -> list[dict]:
+    with get_db() as conn:
+        rows = conn.execute(
+            """SELECT customer_id AS id,probability,prediction,
+                      confidence,risk_score,status,flag,predicted_at
+               FROM predictions WHERE upload_id=?
+               ORDER BY risk_score DESC""",
+            (upload_id,),
+        ).fetchall()
+    return [dict(r) for r in rows]
 
 
-def get_chart_data_from_db(upload_id: int) -> dict:
-    """All chart data from SQL queries — no Python lists held in RAM."""
-    db = get_db()
+def update_predictions_threshold(upload_id: int, threshold: float) -> dict:
+    """Re-classify all predictions in an upload with a new threshold."""
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT id, probability FROM predictions WHERE upload_id=?",
+            (upload_id,),
+        ).fetchall()
 
-    scatter_rows = db.execute(
-        """
-        SELECT risk_score, confidence, status, customer_id
-        FROM predictions WHERE upload_id = ?
-        ORDER BY id LIMIT 5000
-        """,
-        (upload_id,),
-    ).fetchall()
+        updates = []
+        for r in rows:
+            prob = r["probability"]
+            pred = 1 if prob >= threshold else 0
+            conf = prob if pred == 1 else (1.0 - prob)
+            risk = round(prob * 100, 2)
+            status = "Theft" if pred == 1 else "Normal"
+            updates.append((pred, conf, risk, status, r["id"]))
 
-    risks    = [r["risk_score"]  for r in scatter_rows]
-    confs    = [r["confidence"]  for r in scatter_rows]
-    statuses = [r["status"]      for r in scatter_rows]
-    cids     = [r["customer_id"] for r in scatter_rows]
+        conn.executemany(
+            "UPDATE predictions SET prediction=?,confidence=?,risk_score=?,status=? WHERE id=?",
+            updates,
+        )
 
-    pie_row = db.execute(
-        """
-        SELECT
-          SUM(CASE WHEN status='Normal' THEN 1 ELSE 0 END) AS normal_count,
-          SUM(CASE WHEN status='Theft'  THEN 1 ELSE 0 END) AS theft_count
-        FROM predictions WHERE upload_id = ?
-        """,
-        (upload_id,),
-    ).fetchone()
+        agg = conn.execute(
+            """SELECT
+                   SUM(CASE WHEN status='Theft'  THEN 1 ELSE 0 END) AS theft,
+                   SUM(CASE WHEN status='Normal' THEN 1 ELSE 0 END) AS normal,
+                   AVG(confidence) AS avg_conf,
+                   AVG(risk_score) AS avg_risk,
+                   COUNT(*) AS total
+               FROM predictions WHERE upload_id=?""",
+            (upload_id,),
+        ).fetchone()
 
-    top10_high = db.execute(
-        "SELECT customer_id, risk_score, probability FROM predictions "
-        "WHERE upload_id=? ORDER BY risk_score DESC LIMIT 10",
-        (upload_id,),
-    ).fetchall()
+        conn.execute(
+            """UPDATE dataset_uploads
+               SET theft_rows=?,normal_rows=?,avg_confidence=?,
+                   avg_risk=?,theft_rate=?,threshold=?
+               WHERE id=?""",
+            (
+                agg["theft"], agg["normal"],
+                round(float(agg["avg_conf"] or 0), 6),
+                round(float(agg["avg_risk"] or 0), 6),
+                round((agg["theft"] or 0) / max(agg["total"] or 1, 1), 6),
+                threshold,
+                upload_id,
+            ),
+        )
 
-    top10_low = db.execute(
-        "SELECT customer_id, risk_score FROM predictions "
-        "WHERE upload_id=? ORDER BY risk_score ASC LIMIT 10",
-        (upload_id,),
-    ).fetchall()
+    return {"theft": agg["theft"], "normal": agg["normal"]}
 
-    summary = get_upload_summary(upload_id) or {}
 
-    def _trim(cid: str) -> str:
-        return (cid[:12] + "…") if len(cid) > 12 else cid
+def get_chart_data(upload_id: int) -> dict:
+    """Build chart-ready data from SQL — no Python lists held in RAM."""
+    with get_db() as conn:
+        # Pie data
+        pie = conn.execute(
+            """SELECT status, COUNT(*) AS cnt
+               FROM predictions WHERE upload_id=?
+               GROUP BY status""",
+            (upload_id,),
+        ).fetchall()
+
+        # Risk distribution (sample up to 5000 for scatter)
+        scatter = conn.execute(
+            """SELECT risk_score, confidence, status, customer_id
+               FROM predictions WHERE upload_id=?
+               ORDER BY RANDOM() LIMIT 5000""",
+            (upload_id,),
+        ).fetchall()
+
+        # Top 10 high risk
+        top10h = conn.execute(
+            """SELECT customer_id, risk_score, probability
+               FROM predictions WHERE upload_id=?
+               ORDER BY risk_score DESC LIMIT 10""",
+            (upload_id,),
+        ).fetchall()
+
+        # Top 10 low risk
+        top10l = conn.execute(
+            """SELECT customer_id, risk_score
+               FROM predictions WHERE upload_id=?
+               ORDER BY risk_score ASC LIMIT 10""",
+            (upload_id,),
+        ).fetchall()
+
+        # Risk histogram buckets
+        hist = conn.execute(
+            """SELECT CAST(risk_score/5 AS INT)*5 AS bucket, COUNT(*) AS cnt
+               FROM predictions WHERE upload_id=?
+               GROUP BY bucket ORDER BY bucket""",
+            (upload_id,),
+        ).fetchall()
+
+        # Upload row for roc/pr/confusion
+        upload = conn.execute(
+            "SELECT roc_fpr,roc_tpr,pr_precision,pr_recall,confusion_matrix,has_flag "
+            "FROM dataset_uploads WHERE id=?",
+            (upload_id,),
+        ).fetchone()
+
+    pie_data = {r["status"]: r["cnt"] for r in pie}
+
+    def _short(cid: str) -> str:
+        return (cid[:14] + "…") if len(cid) > 14 else cid
+
+    def _dec(x):
+        try:
+            return json.loads(x) if x else None
+        except Exception:
+            return None
 
     return {
-        "risk_distribution": {"values": risks, "labels": statuses},
         "pie": {
             "labels": ["Normal", "Theft"],
-            "values": [pie_row["normal_count"] or 0, pie_row["theft_count"] or 0],
+            "values": [pie_data.get("Normal", 0), pie_data.get("Theft", 0)],
         },
-        "top10_high": {
-            "ids":   [_trim(r["customer_id"]) for r in top10_high],
-            "risks": [r["risk_score"]  for r in top10_high],
-            "probs": [r["probability"] for r in top10_high],
-        },
-        "top10_low": {
-            "ids":   [_trim(r["customer_id"]) for r in top10_low],
-            "risks": [r["risk_score"]  for r in top10_low],
+        "risk_distribution": {
+            "values": [r["risk_score"] for r in scatter],
+            "labels": [r["status"] for r in scatter],
         },
         "scatter": {
-            "risk":       risks,
-            "confidence": confs,
-            "status":     statuses,
-            "ids":        cids,
+            "risk":       [r["risk_score"]  for r in scatter],
+            "confidence": [r["confidence"]  for r in scatter],
+            "status":     [r["status"]      for r in scatter],
+            "ids":        [r["customer_id"] for r in scatter],
         },
-        "confusion": summary.get("confusion_matrix") or [],
+        "top10_high": {
+            "ids":   [_short(r["customer_id"]) for r in top10h],
+            "risks": [r["risk_score"]          for r in top10h],
+            "probs": [r["probability"]         for r in top10h],
+        },
+        "top10_low": {
+            "ids":   [_short(r["customer_id"]) for r in top10l],
+            "risks": [r["risk_score"]          for r in top10l],
+        },
+        "histogram": {
+            "buckets": [r["bucket"] for r in hist],
+            "counts":  [r["cnt"]    for r in hist],
+        },
+        "confusion": _dec(upload["confusion_matrix"]) if upload else None,
         "roc": {
-            "fpr": summary.get("roc_fpr") or [],
-            "tpr": summary.get("roc_tpr") or [],
-        },
+            "fpr": _dec(upload["roc_fpr"]),
+            "tpr": _dec(upload["roc_tpr"]),
+        } if upload else {},
         "pr": {
-            "precision": summary.get("pr_precision") or [],
-            "recall":    summary.get("pr_recall")    or [],
-        },
+            "precision": _dec(upload["pr_precision"]),
+            "recall":    _dec(upload["pr_recall"]),
+        } if upload else {},
+        "has_flag": bool(upload["has_flag"]) if upload else False,
     }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Manual predictions
+# ─────────────────────────────────────────────────────────────────────────────
+def save_manual_prediction(
+    customer_id: Optional[str],
+    probability: float,
+    prediction: int,
+    confidence: float,
+    risk_score: float,
+    status: str,
+    readings: list,
+    predicted_at: str,
+    threshold: float = 0.5,
+    model_name: Optional[str] = None,
+    source: str = "manual",
+) -> int:
+    with _conn() as conn:
+        cur = conn.execute(
+            """INSERT INTO manual_predictions
+               (customer_id,probability,prediction,confidence,risk_score,
+                status,readings,predicted_at,threshold,model_name,source)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                customer_id, probability, prediction, confidence, risk_score,
+                status, json.dumps(readings), predicted_at, threshold, model_name, source,
+            ),
+        )
+        return cur.lastrowid
+
+
+def get_manual_predictions(limit: int = 100, source: Optional[str] = None) -> list[dict]:
+    with get_db() as conn:
+        if source:
+            rows = conn.execute(
+                """SELECT * FROM manual_predictions WHERE source=?
+                   ORDER BY id DESC LIMIT ?""",
+                (source, limit),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM manual_predictions ORDER BY id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+    result = []
+    for r in rows:
+        d = dict(r)
+        try:
+            d["readings"] = json.loads(d["readings"]) if d["readings"] else []
+        except Exception:
+            d["readings"] = []
+        result.append(d)
+    return result
+
+
+def get_manual_prediction_count() -> int:
+    with get_db() as conn:
+        row = conn.execute("SELECT COUNT(*) AS c FROM manual_predictions").fetchone()
+    return row["c"] if row else 0

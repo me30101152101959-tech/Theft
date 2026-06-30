@@ -1,29 +1,28 @@
 """
-Dataset Service  —  SQLite-backed
-==================================
-Handles CSV ingestion, CNN-LSTM batch prediction, and persisting ALL results
-to SQLite.  After this module completes, the data is durable across restarts.
+Dataset Service
+===============
+Handles CSV ingestion, validation, batch prediction, and SQLite persistence.
 
-Rules
------
-  * FLAG column is NEVER used for prediction — only for evaluation
-  * Every prediction calls model.predict() via model_service.predict_batch()
-  * All results are written to SQLite via database.save_predictions_bulk()
-  * No data lives in Python variables after this function returns
+Rules:
+  ▸ FLAG is NEVER used during prediction — only for evaluation
+  ▸ All predictions come from the uploaded CNN-LSTM model via model.predict()
+  ▸ No mock data ever generated
+  ▸ All results written to SQLite immediately after prediction
+  ▸ All read functions query SQLite (survives server restarts)
 """
-from __future__ import annotations
 
-import json
+from __future__ import annotations
+from typing import Optional
+
 import logging
 from datetime import datetime
-from typing import Optional
 
 import numpy as np
 import pandas as pd
 from sklearn.metrics import (
     accuracy_score, precision_score, recall_score,
     f1_score, roc_auc_score, confusion_matrix,
-    roc_curve, precision_recall_curve, classification_report,
+    roc_curve, precision_recall_curve,
 )
 
 import database as db
@@ -33,91 +32,85 @@ from services.feature_service import pipeline
 logger = logging.getLogger(__name__)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# CSV validation
-# ─────────────────────────────────────────────────────────────────────────────
-def _detect_reading_cols(df: pd.DataFrame) -> list:
-    skip = {"CONS_NO", "FLAG"}
-    cols = [c for c in df.columns if c.strip().upper() not in skip]
-    if len(cols) < 26:
+# ─────────────────────────────────────────────
+# Validators
+# ─────────────────────────────────────────────
+ID_COLS   = {"CONS_NO", "CUSTOMER_ID", "ID", "CUSTOMER", "METER_ID"}
+FLAG_COLS = {"FLAG", "LABEL", "TARGET", "THEFT", "Y"}
+
+
+def validate_dataset(df: pd.DataFrame) -> dict:
+    """Dynamically detect id column, flag column, and ALL numeric reading columns."""
+    id_col   = next((c for c in df.columns if c.strip().upper() in ID_COLS), None)
+    flag_col = next((c for c in df.columns if c.strip().upper() in FLAG_COLS), None)
+
+    reading_cols = []
+    for c in df.columns:
+        if c in (id_col, flag_col):
+            continue
+        coerced = pd.to_numeric(df[c], errors="coerce")
+        if coerced.notna().mean() >= 0.5:
+            df[c] = coerced.fillna(0.0)
+            reading_cols.append(c)
+
+    if len(reading_cols) < 2:
         raise ValueError(
-            f"Need at least 26 reading columns; found {len(cols)}. "
-            "Ensure CONS_NO and FLAG columns are named correctly."
+            f"Need at least 2 numeric reading columns; found {len(reading_cols)}. "
+            f"Columns: {list(df.columns)}"
         )
-    return cols[:26]
 
-
-def _validate(df: pd.DataFrame) -> dict:
-    upper_cols = {c.strip().upper() for c in df.columns}
-    if "CONS_NO" not in upper_cols:
-        raise ValueError("Dataset must contain a 'CONS_NO' column.")
-
-    col_map = {c: c.strip().upper() if c.strip().upper() in ("CONS_NO", "FLAG") else c
-               for c in df.columns}
-    df.rename(columns=col_map, inplace=True)
-
-    reading_cols = _detect_reading_cols(df)
-    for c in reading_cols:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-    nan_ct = df[reading_cols].isnull().sum().sum()
-    if nan_ct > 0:
-        logger.warning("%d NaN values — filling with 0", nan_ct)
+    nan_count = int(df[reading_cols].isnull().sum().sum())
+    if nan_count > 0:
         df[reading_cols] = df[reading_cols].fillna(0)
 
-    has_flag = "FLAG" in df.columns
-    return {"reading_cols": reading_cols, "has_flag": has_flag, "total": len(df)}
+    return {
+        "id_col":       id_col,
+        "flag_col":     flag_col,
+        "reading_cols": reading_cols,
+        "has_flag":     flag_col is not None,
+        "total":        len(df),
+        "nan_count":    nan_count,
+        "seq_len":      len(reading_cols),
+    }
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Main pipeline  (CSV → model.predict() → SQLite)
-# ─────────────────────────────────────────────────────────────────────────────
-def load_and_predict(filepath: str, filename: str, threshold: float = 0.5) -> dict:
+# ─────────────────────────────────────────────
+# Main pipeline
+# ─────────────────────────────────────────────
+def load_and_predict(
+    filepath:  str,
+    filename:  str,
+    threshold: float = 0.5,
+    strategy:  str   = "last_n",
+) -> dict:
     """
-    Full pipeline:
-      1. Read CSV
-      2. Validate columns
-      3. Fit MinMaxScaler on readings
-      4. Run model.predict() in batches of 256
-      5. Compute evaluation metrics (only if FLAG present)
-      6. Write everything to SQLite  ← durable storage
-    Returns summary dict.
+    Load CSV → validate → run real model predictions → write ALL to SQLite.
+    Sequence length is detected dynamically and resized to the model length
+    via the chosen strategy. Returns summary dict.
     """
     if not is_model_loaded():
-        raise RuntimeError("No CNN-LSTM model loaded. Upload cnnlstm_final.keras first.")
+        raise RuntimeError("No model loaded. Upload a model first.")
 
-    logger.info("═" * 55)
-    logger.info("  Dataset pipeline started: %s", filename)
-    logger.info("  Model: %s  |  threshold: %.2f", model_state.model_name, threshold)
-    logger.info("═" * 55)
+    logger.info("Loading dataset: %s", filename)
+    df   = pd.read_csv(filepath)
+    meta = validate_dataset(df)
 
-    df = pd.read_csv(filepath)
-    meta = _validate(df)
-    reading_cols: list = meta["reading_cols"]
-    has_flag: bool = meta["has_flag"]
+    reading_cols = meta["reading_cols"]
+    has_flag     = meta["has_flag"]
+    id_col       = meta["id_col"]
+    flag_col     = meta["flag_col"]
+    readings     = df[reading_cols].values.astype(np.float32)
+    n            = len(readings)
 
-    readings = df[reading_cols].values.astype(np.float32)   # (N, 26)
-    n = len(readings)
-    logger.info("Rows: %d  |  Reading cols: %s", n, reading_cols[:3])
-
-    # ── Feature engineering ──────────────────────────────────────────
-    logger.info("Computing 59 statistical features and fitting MinMaxScaler...")
-    stat_feats = pipeline.fit_transform(readings)           # (N, 59)
-    logger.info("stat_feats.shape = %s", stat_feats.shape)
-
-    # ── CNN-LSTM inference ───────────────────────────────────────────
     logger.info(
-        "model.predict() input shape → (%d, 26, 1) | model: %s",
-        n, model_state.model_name,
+        "Predicting %d customers | detected_seq_len=%d | model_seq_len=%s | strategy=%s",
+        n, meta["seq_len"], model_state.seq_len_expected, strategy,
     )
-    probs = predict_batch(
-        readings=readings,
-        stat_feats=stat_feats if model_state.is_dual_input else None,
-        threshold=threshold,
-    )
-    logger.info("model.predict() complete | output shape → %s", probs.shape)
+    from services.model_service import predict_sequences
+    probs = predict_sequences(readings, strategy=strategy, threshold=threshold, fit_scaler=True)
 
-    # ── Build prediction rows ────────────────────────────────────────
     now = datetime.utcnow().isoformat()
+
     rows = []
     for i, (_, row) in enumerate(df.iterrows()):
         prob = float(probs[i])
@@ -125,108 +118,181 @@ def load_and_predict(filepath: str, filename: str, threshold: float = 0.5) -> di
         conf = prob if pred == 1 else (1.0 - prob)
         risk = round(prob * 100, 2)
         rows.append({
-            "customer_id": str(row["CONS_NO"]),
+            "customer_id": str(row[id_col]) if id_col else f"ROW_{i+1}",
             "probability": round(prob, 6),
-            "prediction": pred,
-            "confidence": round(conf, 6),
-            "risk_score": risk,
-            "status": "Theft" if pred == 1 else "Normal",
-            "flag": int(row["FLAG"]) if has_flag else None,
-            "readings": [float(row[c]) for c in reading_cols],
+            "prediction":  pred,
+            "confidence":  round(conf, 6),
+            "risk_score":  risk,
+            "status":      "Theft" if pred == 1 else "Normal",
+            "flag":        int(row[flag_col]) if flag_col else None,
+            "readings":    [float(row[c]) for c in reading_cols],
             "predicted_at": now,
         })
 
-    theft_count  = sum(1 for r in rows if r["prediction"] == 1)
-    normal_count = n - theft_count
-    avg_conf = float(np.mean([r["confidence"] for r in rows]))
-    avg_risk = float(np.mean([r["risk_score"]  for r in rows]))
-    theft_rate = round(theft_count / n, 6) if n else 0.0
-
-    # ── Evaluation metrics ───────────────────────────────────────────
+    # Evaluation (FLAG only used here — never for prediction)
     accuracy = precision_val = recall_val = f1 = roc_auc = None
-    roc_fpr = roc_tpr = pr_prec = pr_rec = confusion_mat = None
+    roc_fpr = roc_tpr = pr_prec = pr_rec = conf_mat = None
 
     if has_flag:
-        y_true = df["FLAG"].values.astype(int)
+        y_true = df[flag_col].values.astype(int)
         y_pred = (probs >= threshold).astype(int)
-
-        accuracy     = round(float(accuracy_score(y_true, y_pred)), 6)
-        precision_val= round(float(precision_score(y_true, y_pred, zero_division=0)), 6)
-        recall_val   = round(float(recall_score(y_true, y_pred, zero_division=0)), 6)
-        f1           = round(float(f1_score(y_true, y_pred, zero_division=0)), 6)
+        accuracy      = round(float(accuracy_score(y_true, y_pred)), 6)
+        precision_val = round(float(precision_score(y_true, y_pred, zero_division=0)), 6)
+        recall_val    = round(float(recall_score(y_true, y_pred, zero_division=0)), 6)
+        f1            = round(float(f1_score(y_true, y_pred, zero_division=0)), 6)
         try:
             roc_auc = round(float(roc_auc_score(y_true, probs)), 6)
         except Exception:
             roc_auc = 0.0
+        cm           = confusion_matrix(y_true, y_pred)
+        fpr, tpr, _  = roc_curve(y_true, probs)
+        pp, rr, _    = precision_recall_curve(y_true, probs)
+        conf_mat     = cm.tolist()
+        roc_fpr      = fpr.tolist()
+        roc_tpr      = tpr.tolist()
+        pr_prec      = pp.tolist()
+        pr_rec       = rr.tolist()
 
-        cm = confusion_matrix(y_true, y_pred)
-        fpr, tpr, _ = roc_curve(y_true, probs)
-        prec_arr, rec_arr, _ = precision_recall_curve(y_true, probs)
+    theft   = sum(1 for r in rows if r["prediction"] == 1)
+    normal  = n - theft
+    avg_conf = float(np.mean([r["confidence"]  for r in rows]))
+    avg_risk = float(np.mean([r["risk_score"]  for r in rows]))
 
-        confusion_mat = cm.tolist()
-        roc_fpr = fpr.tolist()
-        roc_tpr = tpr.tolist()
-        pr_prec = prec_arr.tolist()
-        pr_rec  = rec_arr.tolist()
-
-        logger.info(
-            "Evaluation  acc=%.4f  prec=%.4f  rec=%.4f  f1=%.4f  auc=%.4f",
-            accuracy, precision_val, recall_val, f1, roc_auc,
-        )
-
-    # ── Persist to SQLite ────────────────────────────────────────────
-    logger.info("Writing %d rows to SQLite...", n)
     upload_id = db.save_upload(
-        filename=filename,
-        upload_time=now,
-        total_rows=n,
-        theft_rows=theft_count,
-        normal_rows=normal_count,
-        avg_confidence=round(avg_conf, 6),
-        avg_risk=round(avg_risk, 6),
-        theft_rate=theft_rate,
-        has_flag=has_flag,
-        threshold=threshold,
-        accuracy=accuracy,
-        precision_val=precision_val,
-        recall_val=recall_val,
-        f1_score=f1,
-        roc_auc=roc_auc,
-        roc_fpr=roc_fpr,
-        roc_tpr=roc_tpr,
-        pr_precision=pr_prec,
-        pr_recall=pr_rec,
-        confusion_matrix=confusion_mat,
+        filename       = filename,
+        upload_time    = now,
+        total_rows     = n,
+        theft_rows     = theft,
+        normal_rows    = normal,
+        avg_confidence = round(avg_conf, 6),
+        avg_risk       = round(avg_risk, 6),
+        theft_rate     = round(theft / n, 6) if n else 0.0,
+        has_flag       = has_flag,
+        threshold      = threshold,
+        accuracy       = accuracy,
+        precision_val  = precision_val,
+        recall_val     = recall_val,
+        f1_score       = f1,
+        roc_auc        = roc_auc,
+        roc_fpr        = roc_fpr,
+        roc_tpr        = roc_tpr,
+        pr_precision   = pr_prec,
+        pr_recall      = pr_rec,
+        confusion_matrix = conf_mat,
     )
     db.save_predictions_bulk(upload_id, rows)
+
     logger.info(
-        "SQLite write complete: upload_id=%d  theft=%d  normal=%d",
-        upload_id, theft_count, normal_count,
+        "SQLite: upload_id=%d  theft=%d  normal=%d  total=%d",
+        upload_id, theft, normal, n,
     )
 
+    metrics = {}
+    if has_flag:
+        metrics = {
+            "accuracy":  accuracy,
+            "precision": precision_val,
+            "recall":    recall_val,
+            "f1_score":  f1,
+            "roc_auc":   roc_auc,
+        }
+
     return {
-        "upload_id": upload_id,
-        "total": n,
-        "theft": theft_count,
-        "normal": normal_count,
+        "total":        n,
+        "theft":        theft,
+        "normal":       normal,
         "avg_confidence": round(avg_conf, 4),
-        "avg_risk": round(avg_risk, 4),
-        "theft_rate": round(theft_rate, 4),
-        "has_flag": has_flag,
-        "accuracy": accuracy,
-        "precision": precision_val,
-        "recall": recall_val,
-        "f1_score": f1,
-        "roc_auc": roc_auc,
+        "avg_risk":     round(avg_risk, 4),
+        "has_flag":     has_flag,
+        "metrics":      metrics,
         "dataset_name": filename,
-        "upload_time": now,
-        "model_used": model_state.model_name,
+        "upload_time":  now,
+        "model_used":   model_state.model_name,
+        "upload_id":    upload_id,
     }
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# State checks  (read from SQLite — never from RAM)
-# ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────
+# Read functions — ALL from SQLite
+# ─────────────────────────────────────────────
 def is_dataset_loaded() -> bool:
-    """Returns True if any upload exists in SQLite."""
     return db.has_any_upload()
+
+
+def get_dashboard_stats() -> dict:
+    uid = db.get_latest_upload_id()
+    if uid is None:
+        return {}
+    row = db.get_upload_summary(uid)
+    if not row:
+        return {}
+    return {
+        "total_customers":     row["total_rows"],
+        "processed_customers": row["total_rows"],
+        "predicted_theft":     row["theft_rows"],
+        "predicted_normal":    row["normal_rows"],
+        "avg_confidence":      row["avg_confidence"] or 0.0,
+        "avg_risk_score":      row["avg_risk"] or 0.0,
+        "theft_rate":          row["theft_rate"] or 0.0,
+        "dataset_name":        row["filename"],
+        "upload_time":         row["upload_time"],
+        "has_flag":            bool(row["has_flag"]),
+        "threshold":           row["threshold"],
+        "accuracy":            row["accuracy"],
+        "precision":           row["precision_val"],
+        "recall":              row["recall_val"],
+        "f1_score":            row["f1_score"],
+        "roc_auc":             row["roc_auc"],
+        "data_source":         "SQLite — etd_xai.db",
+    }
+
+
+def get_customers_paginated(
+    page: int = 1,
+    page_size: int = 50,
+    search: str = "",
+    status_filter: str = "",
+    sort_by: str = "risk_score",
+    sort_dir: str = "desc",
+) -> dict:
+    uid = db.get_latest_upload_id()
+    if uid is None:
+        return {"data": [], "total": 0, "page": 1, "page_size": page_size, "total_pages": 0}
+    return db.get_customers_paginated(
+        upload_id     = uid,
+        page          = page,
+        page_size     = page_size,
+        search        = search,
+        status_filter = status_filter,
+        sort_by       = sort_by,
+        sort_dir      = sort_dir,
+    )
+
+
+def get_chart_data() -> dict:
+    uid = db.get_latest_upload_id()
+    if uid is None:
+        return {}
+    return db.get_chart_data(uid)
+
+
+def get_all_customers_for_export() -> list:
+    uid = db.get_latest_upload_id()
+    if uid is None:
+        return []
+    return db.get_all_customers_for_export(uid)
+
+
+def get_customer_by_id(customer_id: str) -> Optional[dict]:
+    uid = db.get_latest_upload_id()
+    if uid is None:
+        return None
+    return db.get_customer_by_id(uid, customer_id)
+
+
+def re_predict_with_threshold(threshold: float) -> dict:
+    uid = db.get_latest_upload_id()
+    if uid is None:
+        raise RuntimeError("No dataset in SQLite.")
+    db.update_predictions_threshold(uid, threshold)
+    return get_dashboard_stats()

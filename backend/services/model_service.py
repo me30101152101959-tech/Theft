@@ -1,24 +1,23 @@
 """
-CNN-LSTM Model Service
-======================
-Loads, validates, and runs inference with the CNN-LSTM model.
+Model Service  (dynamic, model-driven)
+======================================
+Loads any Keras CNN/LSTM model and runs inference. ALL dimensions are
+discovered at runtime from the model and the uploaded data — nothing is
+hardcoded (no 26, no 59, no fixed reshape).
 
-On every backend startup:
-  * Reads model_registry from SQLite for the last known model path
-  * If the file still exists on disk, loads it automatically
-  * Dashboard works immediately — no manual re-upload required
+Discovered from the model on load:
+  • seq_len_expected   : sequence length the model wants (int, or None=variable)
+  • seq_channels       : channels of the sequence input (usually 1)
+  • is_dual_input      : whether a second statistical input exists
+  • stat_input_size    : number of statistical features the model wants
 
-Rules
------
-  * ONLY .keras / .h5 files accepted
-  * Architecture must contain Conv1D + LSTM layers
-  * BiGRU / BiLSTM / Transfer-Learning / Ensemble models are rejected
-  * Input tensor: (batch, 26, 1)   Output tensor: (batch, 1) sigmoid
-  * Every prediction calls model.predict()  — no shortcuts
-  * FLAG is NEVER used for prediction
+Rules still enforced:
+  • Real TF inference only — never fake / fallback / zero-substituted predictions
+  • FLAG is never used during prediction
+  • Model registry persisted in SQLite (survives restarts)
 """
-from __future__ import annotations
 
+from __future__ import annotations
 import io
 import logging
 import os
@@ -26,51 +25,63 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional, Tuple
 
-import keras
 import numpy as np
 import tensorflow as tf
 
-from services.feature_service import pipeline
+from services.feature_service import pipeline, scale_sequences, extract_features
+from services import preprocessing
 
 logger = logging.getLogger(__name__)
+
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 tf.get_logger().setLevel("ERROR")
 
+# Exact message required when no valid CNN-LSTM model is available.
+NO_MODEL_MSG = "No valid CNN-LSTM model is currently loaded. Please load a valid .keras model."
 
-# ── Keras 3.13 ↔ 3.10 compatibility shim ─────────────────────────────────
-# Models saved with Keras 3.11+ store `quantization_config` in Dense layer
-# configs, which older Keras doesn't recognise. Monkey-patch removes it.
-_orig_dense_from_config = keras.layers.Dense.from_config.__func__
-
-
-@classmethod  # type: ignore[misc]
-def _compat_dense_from_config(cls, config):
-    config = dict(config)
-    config.pop("quantization_config", None)
-    dtype = config.get("dtype")
-    if isinstance(dtype, dict):
-        config["dtype"] = dtype.get("config", {}).get("name", "float32")
-    return _orig_dense_from_config(cls, config)
-
-
-keras.layers.Dense.from_config = _compat_dense_from_config  # type: ignore[method-assign]
-logger.info("Applied Keras 3.13→3.10 Dense.from_config compatibility shim")
+# Holds the verification details of the most recent model.predict() call,
+# exposed via /api/model/status so the frontend can prove inference is real.
+last_prediction: dict = {}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# In-process state  (model object lives here — SQLite stores metadata)
+# Keras compatibility shim (strips quantization_config / flattens DTypePolicy)
+# ─────────────────────────────────────────────────────────────────────────────
+try:
+    import keras
+    _orig_dense_from_config = keras.layers.Dense.from_config.__func__
+
+    @classmethod  # type: ignore[misc]
+    def _compat_dense_from_config(cls, config):
+        config = dict(config)
+        config.pop("quantization_config", None)
+        dtype = config.get("dtype")
+        if isinstance(dtype, dict):
+            config["dtype"] = dtype.get("config", {}).get("name", "float32")
+        return _orig_dense_from_config(cls, config)
+
+    keras.layers.Dense.from_config = _compat_dense_from_config
+    logger.debug("Keras compat shim applied.")
+except Exception:
+    pass
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# State
 # ─────────────────────────────────────────────────────────────────────────────
 class ModelState:
-    model:           Optional[keras.Model] = None
-    model_name:      str   = ""
-    model_path:      str   = ""
-    upload_time:     str   = ""
-    input_shape:     tuple = ()
-    output_shape:    tuple = ()
-    total_params:    int   = 0
-    summary_text:    str   = ""
-    is_dual_input:   bool  = False
-    stat_input_size: int   = 0
+    model:            Optional[tf.keras.Model] = None
+    model_name:       str   = ""
+    model_path:       str   = ""
+    upload_time:      str   = ""
+    input_shape:      tuple = ()
+    output_shape:     tuple = ()
+    total_params:     int   = 0
+    summary_text:     str   = ""
+    is_dual_input:    bool  = False
+    stat_input_size:  int   = 0
+    seq_len_expected: Optional[int] = None    # None => variable length
+    seq_channels:     int   = 1
 
 
 state = ModelState()
@@ -79,166 +90,143 @@ state = ModelState()
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────────────────────────────────────
-def _capture_summary(model: keras.Model) -> str:
+def _capture_summary(model: tf.keras.Model) -> str:
     buf = io.StringIO()
     model.summary(print_fn=lambda x: buf.write(x + "\n"))
     return buf.getvalue()
 
 
-def _detect_dual_input(model: keras.Model) -> Tuple[bool, int]:
+def _rank(shape) -> int:
+    r = getattr(shape, "rank", None)
+    return r if r is not None else len(shape)
+
+
+def _detect_dual_input(model: tf.keras.Model) -> Tuple[bool, int]:
+    """Detect a 2-D statistical input alongside the 3-D sequence input."""
     if len(model.inputs) == 2:
         for inp in model.inputs:
-            name = getattr(inp, "name", "") or ""
-            if "stat" in name.lower():
+            if _rank(inp.shape) == 2:
                 return True, int(inp.shape[-1])
+        # fallback: name-based
         for inp in model.inputs:
-            if len(tuple(inp.shape)) == 2:
+            if "stat" in inp.name.lower():
                 return True, int(inp.shape[-1])
     return False, 0
 
 
-def _validate_architecture(model: keras.Model, filename: str) -> None:
+def _detect_sequence_input(model: tf.keras.Model):
+    """Return the 3-D sequence input tensor (or None)."""
+    for inp in model.inputs:
+        if _rank(inp.shape) == 3:
+            return inp
+    return None
+
+
+def _validate_architecture(model: tf.keras.Model, filename: str) -> None:
     layer_classes = {l.__class__.__name__.lower() for l in model.layers}
-    name_lower    = filename.lower()
-    for banned in ("bigru", "bilstm", "ensemble", "transfer"):
-        if banned in name_lower:
-            raise ValueError(
-                f"Rejected: filename contains '{banned}'. "
-                "Only CNN-LSTM models are accepted."
-            )
-    has_conv = any("conv1d" in c for c in layer_classes)
-    has_lstm = any("lstm"   in c for c in layer_classes)
-    if not (has_conv or has_lstm):
+    has_conv = any("conv" in c for c in layer_classes)
+    has_rnn  = any(k in c for c in layer_classes for k in ("lstm", "gru", "rnn"))
+    if not (has_conv or has_rnn):
         raise ValueError(
-            "Rejected: model lacks Conv1D or LSTM layers. "
-            "Only CNN-LSTM architectures are accepted."
-        )
-    if "bidirectional" in layer_classes:
-        raise ValueError(
-            "Rejected: model uses Bidirectional (BiGRU/BiLSTM) layers. "
-            "Only uni-directional CNN-LSTM is accepted."
+            "Rejected: the model contains no Conv or recurrent (LSTM/GRU/RNN) layers. "
+            "A temporal sequence model is required."
         )
 
 
-def _load_from_path(model_path: str, filename: str) -> dict:
-    """
-    Core loader.  Returns metadata dict on success.
-    Mutates module-level `state`.
-    """
+def _load_from_path(model_path: str, filename: str) -> None:
+    """Load model file and populate state with dynamically discovered dimensions."""
     global state
-
-    logger.info("─" * 55)
-    logger.info("  keras.models.load_model('%s', compile=False)", model_path)
-    logger.info("  TensorFlow %s | Keras %s", tf.__version__, keras.__version__)
-
-    model = keras.models.load_model(model_path, compile=False)
+    model = tf.keras.models.load_model(model_path)
     _validate_architecture(model, filename)
 
-    # Validate sequence_input shape
-    seq_input = None
-    for inp in model.inputs:
-        if len(tuple(inp.shape)) == 3:
-            seq_input = inp
-            break
+    seq_input = _detect_sequence_input(model)
     if seq_input is None:
-        raise ValueError("No 3-D sequence input found. Expected (None, 26, 1).")
-    seq_shape = tuple(seq_input.shape)[1:]
-    if seq_shape != (26, 1):
         raise ValueError(
-            f"Incompatible sequence input shape {seq_shape}. Expected (26, 1)."
+            "No 3-D sequence input found. Expected a model whose sequence input "
+            "has shape (None, T, C)."
         )
+
+    seq_shape = tuple(seq_input.shape[1:])           # (T, C) — T may be None
+    seq_len   = seq_shape[0]                          # int or None
+    seq_chan  = seq_shape[1] if len(seq_shape) > 1 and seq_shape[1] else 1
 
     is_dual, stat_size = _detect_dual_input(model)
 
-    try:
-        in_shape = model.input_shape
-        input_shape = tuple(in_shape) if isinstance(in_shape, (list, tuple)) else (in_shape,)
-    except Exception:
-        input_shape = tuple(tuple(i.shape) for i in model.inputs)
-    try:
-        out_shape = model.output_shape
-        output_shape = tuple(out_shape) if isinstance(out_shape, (list, tuple)) else (out_shape,)
-    except Exception:
-        output_shape = tuple(tuple(o.shape) for o in model.outputs)
-
-    total_params = model.count_params()
-    summary      = _capture_summary(model)
-    now          = datetime.utcnow().isoformat()
-
-    state.model           = model
-    state.model_name      = filename
-    state.model_path      = model_path
-    state.upload_time     = now
-    state.input_shape     = input_shape
-    state.output_shape    = output_shape
-    state.total_params    = total_params
-    state.summary_text    = summary
-    state.is_dual_input   = is_dual
-    state.stat_input_size = stat_size
+    state.model            = model
+    state.model_name       = filename
+    state.model_path       = model_path
+    state.upload_time      = datetime.utcnow().isoformat()
+    state.input_shape      = tuple(model.input_shape) if isinstance(model.input_shape, (list, tuple)) else (model.input_shape,)
+    state.output_shape     = tuple(model.output_shape)
+    state.total_params     = model.count_params()
+    state.summary_text     = _capture_summary(model)
+    state.is_dual_input    = is_dual
+    state.stat_input_size  = stat_size
+    state.seq_len_expected = int(seq_len) if seq_len is not None else None
+    state.seq_channels     = int(seq_chan)
 
     logger.info(
-        "  Model loaded: %s | params=%d | dual_input=%s | stat_size=%d",
-        filename, total_params, is_dual, stat_size,
+        "Model loaded: %s | seq_len=%s | channels=%d | dual=%s | stat=%d | params=%d",
+        filename, state.seq_len_expected, state.seq_channels,
+        is_dual, stat_size, state.total_params,
     )
-    logger.info("  Input shape  → %s", input_shape)
-    logger.info("  Output shape → %s", output_shape)
-    logger.info("─" * 55)
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Public API — loading
+# ─────────────────────────────────────────────────────────────────────────────
+def load_model(model_path: str, filename: str) -> dict:
+    ext = Path(filename).suffix.lower()
+    if ext not in (".keras", ".h5"):
+        raise ValueError(f"Unsupported format: {ext}. Use .keras or .h5")
+
+    logger.info("Loading model from %s", model_path)
+    _load_from_path(model_path, filename)
+
+    import database as db
+    db.register_model(
+        model_name      = filename,
+        model_path      = model_path,
+        loaded_at       = state.upload_time,
+        input_shape     = str(state.input_shape),
+        output_shape    = str(state.output_shape),
+        total_params    = state.total_params,
+        is_dual_input   = state.is_dual_input,
+        stat_input_size = state.stat_input_size,
+    )
+    logger.info("Model registered in SQLite.")
     return get_model_info()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Public API
-# ─────────────────────────────────────────────────────────────────────────────
-def load_model(model_path: str, filename: str) -> dict:
-    """
-    Load + validate + register model.
-    Called from the upload endpoint and from startup auto-load.
-    Persists model metadata to SQLite.
-    """
-    info = _load_from_path(model_path, filename)
-
-    # Persist to SQLite so the next restart can find it
-    import database as db
-    db.register_model(
-        model_name     = filename,
-        model_path     = model_path,
-        loaded_at      = state.upload_time,
-        input_shape    = str(state.input_shape),
-        output_shape   = str(state.output_shape),
-        total_params   = state.total_params,
-        is_dual_input  = state.is_dual_input,
-        stat_input_size= state.stat_input_size,
-    )
-    return info
-
-
 def auto_load_on_startup() -> bool:
-    """
-    Called during FastAPI lifespan.
-    Reads the last model_path from SQLite; if the file exists, loads it.
-    Returns True if model was loaded.
-    """
     import database as db
     record = db.get_active_model()
     if not record:
-        logger.info("Startup: no model in SQLite registry — waiting for upload.")
+        # Bootstrap: a fresh clone has an empty registry, but a model file may be
+        # bundled in the repo / mounted volume. Auto-register it so the app works
+        # immediately after cloning with no manual upload.
+        candidates = []
+        if os.environ.get("MODEL_PATH"):
+            candidates.append(os.environ["MODEL_PATH"])
+        candidates += ["uploads/model/cnnlstm_final.keras", "uploads/models/cnnlstm_final.keras"]
+        bootstrap = next((p for p in candidates if Path(p).exists()), None)
+        if bootstrap:
+            try:
+                load_model(bootstrap, Path(bootstrap).name)
+                logger.info("Startup: bootstrapped bundled model from %s", bootstrap)
+                return True
+            except Exception as exc:
+                logger.error("Startup: bootstrap of '%s' failed — %s", bootstrap, exc)
+                return False
+        logger.info("Startup: no registry model and no bundled model — waiting for upload.")
         return False
-
     path = record["model_path"]
-    name = record["model_name"]
     if not Path(path).exists():
-        logger.warning(
-            "Startup: model path '%s' no longer exists on disk — "
-            "please re-upload cnnlstm_final.keras.",
-            path,
-        )
+        logger.warning("Startup: model path '%s' no longer on disk.", path)
         return False
-
-    logger.info("Startup: auto-loading model from SQLite registry → %s", path)
     try:
-        _load_from_path(path, name)
-        logger.info("Startup: model ready — dashboard will use SQLite data immediately.")
+        _load_from_path(path, record["model_name"])
+        logger.info("Startup: auto-loaded model from SQLite registry.")
         return True
     except Exception as exc:
         logger.error("Startup: auto-load failed — %s", exc)
@@ -252,13 +240,14 @@ def unload_model() -> None:
         state.model = None
     state = ModelState()
     pipeline.reset()
-    keras.backend.clear_session()
-    logger.info("Model unloaded from memory.")
+    tf.keras.backend.clear_session()
+    logger.info("Model unloaded.")
 
 
 def get_model_info() -> dict:
     if state.model is None:
         return {"loaded": False}
+    import keras as _keras
     return {
         "loaded":           True,
         "model_name":       state.model_name,
@@ -270,11 +259,13 @@ def get_model_info() -> dict:
         "total_params_fmt": f"{state.total_params:,}",
         "is_dual_input":    state.is_dual_input,
         "stat_input_size":  state.stat_input_size,
+        "seq_len_expected": state.seq_len_expected,        # None => variable
+        "is_variable_length": state.seq_len_expected is None,
+        "seq_channels":     state.seq_channels,
         "summary":          state.summary_text,
-        "architecture":     "CNN-LSTM",
-        "tensorflow_version": tf.__version__,
-        "keras_version":    keras.__version__,
-        "load_proof":       f"keras.models.load_model('{state.model_path}', compile=False)",
+        "tf_version":       tf.__version__,
+        "keras_version":    getattr(_keras, "__version__", "unknown"),
+        "architecture":     "CNN-LSTM" if state.is_dual_input else "Sequence model",
     }
 
 
@@ -283,89 +274,233 @@ def is_model_loaded() -> bool:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Prediction core
+# Compatibility check
 # ─────────────────────────────────────────────────────────────────────────────
-def _build_inputs(readings: np.ndarray, stat_feats: Optional[np.ndarray]):
-    seq = readings.reshape(-1, 26, 1).astype(np.float32)
-    if state.is_dual_input:
-        if stat_feats is None:
-            raise RuntimeError("Dual-input model requires stat_feats but none provided.")
-        return {"sequence_input": seq, "stat_input": stat_feats.astype(np.float32)}
-    return seq
+def check_compatibility(uploaded_len: int, strategy: str = "last_n") -> dict:
+    """Compare uploaded sequence length to what the model expects."""
+    if state.model is None:
+        return {"compatible": False, "reason": "No model loaded."}
+
+    T = state.seq_len_expected
+    if T is None:
+        return {
+            "compatible": True,
+            "expected_len": None,
+            "uploaded_len": uploaded_len,
+            "variable_length": True,
+            "preprocessing_needed": False,
+            "reason": "Model accepts variable-length sequences — full series sent as-is.",
+        }
+
+    if uploaded_len == T:
+        return {
+            "compatible": True,
+            "expected_len": T,
+            "uploaded_len": uploaded_len,
+            "variable_length": False,
+            "preprocessing_needed": False,
+            "reason": "Uploaded sequence length matches the model exactly.",
+        }
+
+    # Mismatch — solvable with preprocessing
+    if uploaded_len > T:
+        suggestion = "last_n (recent readings) or interpolate (resample whole series)"
+    else:
+        suggestion = "pad (zero-fill to model length) or interpolate"
+
+    return {
+        "compatible": True,            # solvable via preprocessing
+        "expected_len": T,
+        "uploaded_len": uploaded_len,
+        "variable_length": False,
+        "preprocessing_needed": True,
+        "selected_strategy": strategy,
+        "reason": f"Uploaded length {uploaded_len} != model length {T}. "
+                  f"Will apply '{strategy}' preprocessing.",
+        "suggested_strategy": suggestion,
+    }
 
 
-def predict_batch(
-    readings:   np.ndarray,
-    stat_feats: Optional[np.ndarray] = None,
-    batch_size: int = 256,
-    threshold:  float = 0.5,
-) -> np.ndarray:
+# ─────────────────────────────────────────────────────────────────────────────
+# Prediction core — dynamic
+# ─────────────────────────────────────────────────────────────────────────────
+def _model_ready(raw_2d: np.ndarray, strategy: str) -> np.ndarray:
+    """Resize raw (N,L) to the model's expected length (N,T). Variable-length → as-is."""
+    T = state.seq_len_expected
+    if T is None or raw_2d.shape[1] == T:
+        return raw_2d.astype(np.float32)
+    return preprocessing.resize_sequences(raw_2d, T, strategy)
+
+
+def _build_stat(raw_ready_2d: np.ndarray, fit_scaler: bool) -> np.ndarray:
+    """Compute + scale statistical features. Raises if count != model expectation."""
+    raw_feats = extract_features(raw_ready_2d)
+    if raw_feats.shape[1] != state.stat_input_size:
+        raise ValueError(
+            f"Statistical-feature mismatch: the feature extractor produced "
+            f"{raw_feats.shape[1]} features but the model requires "
+            f"{state.stat_input_size}. Cannot generate the exact features this "
+            f"model was trained on — refusing to substitute zeros."
+        )
+    return pipeline.fit_transform(raw_ready_2d) if fit_scaler else pipeline.transform(raw_ready_2d)
+
+
+def _raw_predict(seq_ready_2d: np.ndarray, stat: Optional[np.ndarray], batch_size: int) -> np.ndarray:
     """
-    Run model.predict() in mini-batches.
-    readings   : (N, 26) float32
-    stat_feats : (N, 59) float32  — required for dual-input models
-    Returns    : (N,) float32 probabilities
+    The ONLY inference choke-point. Scales the sequence per-row, assembles inputs,
+    and runs tensorflow.keras model.predict(). Logs full verification afterwards.
+    There is no fallback path — if this fails, prediction fails.
     """
     if state.model is None:
-        raise RuntimeError("No model loaded.")
+        raise RuntimeError(NO_MODEL_MSG)
 
-    probs = []
-    n = len(readings)
-    for i in range(0, n, batch_size):
-        r_batch = readings[i: i + batch_size]
-        s_batch = stat_feats[i: i + batch_size] if stat_feats is not None else None
-        inputs  = _build_inputs(r_batch, s_batch)
-        logger.debug(
-            "model.predict() batch %d–%d | seq_shape=%s",
-            i, min(i + batch_size, n) - 1,
-            r_batch.reshape(-1, 26, 1).shape,
-        )
-        out = state.model.predict(inputs, verbose=0, batch_size=batch_size)
-        probs.append(out.flatten())
+    seq_scaled = scale_sequences(seq_ready_2d)
+    L = seq_scaled.shape[1]
+    seq = seq_scaled.reshape(-1, L, state.seq_channels).astype(np.float32)
 
-    result = np.concatenate(probs, axis=0).astype(np.float32)
-    logger.debug("predict_batch output shape: %s", result.shape)
+    if state.is_dual_input:
+        if stat is None:
+            raise RuntimeError("Model requires stat_input but none was provided.")
+        inputs = {"sequence_input": seq, "stat_input": stat.astype(np.float32)}
+        in_shape = f"[{seq.shape}, {stat.shape}]"
+    else:
+        inputs = seq
+        in_shape = str(seq.shape)
+
+    out = state.model.predict(inputs, verbose=0, batch_size=batch_size)
+    probs = out.flatten().astype(np.float32)
+
+    _log_verification(in_shape, out.shape, probs)
+    return probs
+
+
+def _log_verification(input_shape: str, output_shape, probs: np.ndarray) -> None:
+    """Record + log the verification trail for this model.predict() call."""
+    import keras as _keras
+    raw0  = float(probs[0]) if len(probs) else float("nan")
+    label = "Theft" if raw0 >= 0.5 else "Normal"
+    ts    = datetime.utcnow().isoformat()
+
+    last_prediction.clear()
+    last_prediction.update({
+        "active_model":    state.model_name,
+        "engine":          "TensorFlow / Keras",
+        "tf_version":      tf.__version__,
+        "keras_version":   getattr(_keras, "__version__", "unknown"),
+        "input_shape":     input_shape,
+        "output_shape":    str(tuple(output_shape)),
+        "raw_output":      round(raw0, 6),
+        "predicted_label": label,
+        "n_rows":          int(len(probs)),
+        "timestamp":       ts,
+    })
+
+    logger.info(
+        "PREDICTION VERIFIED | Active Model: %s | Engine: TensorFlow/Keras | "
+        "TF %s | Keras %s | Input Shape: %s | Output Shape: %s | "
+        "Raw Output: %.6f | Predicted Label: %s | rows=%d | %s",
+        state.model_name, tf.__version__, getattr(_keras, "__version__", "unknown"),
+        input_shape, tuple(output_shape), raw0, label, len(probs), ts,
+    )
+
+
+def predict_sequences(
+    raw_2d: np.ndarray,
+    strategy: str = "last_n",
+    threshold: float = 0.5,
+    fit_scaler: bool = True,
+    batch_size: int = 256,
+) -> np.ndarray:
+    """
+    Predict an (N, L) raw-readings array. Handles dynamic length + all strategies.
+    Returns (N,) probabilities. PROOF: real model.predict() on every row.
+    """
+    if state.model is None:
+        raise RuntimeError(NO_MODEL_MSG)
+
+    raw_2d = np.asarray(raw_2d, dtype=np.float32)
+    T = state.seq_len_expected
+
+    # ── Sliding window (only when uploaded longer than model length) ──────────
+    if strategy == "sliding_window" and T is not None and raw_2d.shape[1] > T:
+        all_windows, row_index = [], []
+        for ri, row in enumerate(raw_2d):
+            wins = preprocessing.windows_for_row(row, T)
+            for w in wins:
+                all_windows.append(w)
+                row_index.append(ri)
+        win_arr = np.vstack(all_windows).astype(np.float32)
+
+        stat = _build_stat(win_arr, fit_scaler) if state.is_dual_input else None
+        win_probs = _raw_predict(win_arr, stat, batch_size)
+
+        # aggregate per customer by MAX (theft in any window flags the customer)
+        probs = np.zeros(len(raw_2d), dtype=np.float32)
+        counts = np.zeros(len(raw_2d), dtype=np.int32)
+        for ri, p in zip(row_index, win_probs):
+            probs[ri] = max(probs[ri], p)
+            counts[ri] += 1
+        logger.info("Sliding-window: %d windows across %d customers", len(win_arr), len(raw_2d))
+        return probs
+
+    # ── Standard path (resize once, predict once) ─────────────────────────────
+    ready = _model_ready(raw_2d, strategy)
+    stat  = _build_stat(ready, fit_scaler) if state.is_dual_input else None
+    return _raw_predict(ready, stat, batch_size)
+
+
+def classify(prob: float, threshold: float) -> dict:
+    pred = 1 if prob >= threshold else 0
+    conf = prob if pred == 1 else (1.0 - prob)
+    risk = round(prob * 100, 2)
+    level = "High" if risk >= 75 else "Medium" if risk >= 40 else "Low"
+    return {
+        "probability":  round(float(prob), 6),
+        "prediction":   pred,
+        "confidence":   round(float(conf), 6),
+        "risk_score":   risk,
+        "risk_level":   level,
+        "status":       "Theft" if pred == 1 else "Normal",
+    }
+
+
+def predict_one(readings: np.ndarray, strategy: str = "last_n", threshold: float = 0.5) -> dict:
+    """
+    Predict ONE customer of ANY length. Resizes to the model length if needed.
+    Reuses the scaler fitted on the last batch (single-sample fit is meaningless).
+    """
+    if state.model is None:
+        raise RuntimeError(NO_MODEL_MSG)
+
+    r = np.asarray(readings, dtype=np.float32).flatten().reshape(1, -1)
+    probs = predict_sequences(r, strategy=strategy, threshold=threshold, fit_scaler=False)
+    prob  = float(probs[0])
+
+    result = classify(prob, threshold)
+    T = state.seq_len_expected
+    result.update({
+        "label":          "Electricity Theft Detected" if result["prediction"] == 1 else "Normal Customer",
+        "threshold_used": threshold,
+        "model_name":     state.model_name,
+        "uploaded_len":   int(r.shape[1]),
+        "model_len":      T,
+        "strategy_used":  "none" if (T is None or r.shape[1] == T) else strategy,
+        "predict_proof":  f"model.predict(x) x.shape=(1,{T if T else r.shape[1]},{state.seq_channels}) out={round(prob,6)}",
+    })
     return result
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Backwards-compatible wrappers (older callers)
+# ─────────────────────────────────────────────────────────────────────────────
+def predict_batch(readings, stat_feats=None, batch_size=256, threshold=0.5) -> np.ndarray:
+    """Compat shim: callers that already computed stat_feats. Prefer predict_sequences()."""
+    if stat_feats is not None and state.is_dual_input:
+        return _raw_predict(np.asarray(readings, np.float32), stat_feats, batch_size)
+    return predict_sequences(readings, strategy="last_n", threshold=threshold,
+                             fit_scaler=True, batch_size=batch_size)
+
+
 def predict_single(readings: np.ndarray, threshold: float = 0.5) -> dict:
-    """
-    Predict ONE customer row.
-    readings : (26,) float32
-    Returns full result dict.
-    """
-    if state.model is None:
-        raise RuntimeError("No CNN-LSTM model loaded.")
-
-    r = readings.flatten().astype(np.float32)
-    if len(r) != 26:
-        raise ValueError(f"Expected 26 readings, got {len(r)}.")
-
-    r2d = r.reshape(1, 26)
-    stat = pipeline.transform(r2d)  # (1, 59)
-
-    inputs = _build_inputs(r2d, stat if state.is_dual_input else None)
-    logger.info(
-        "model.predict() single | seq_shape=%s | model=%s",
-        r2d.reshape(1, 26, 1).shape, state.model_name,
-    )
-    out  = state.model.predict(inputs, verbose=0)
-    prob = float(out.flatten()[0])
-
-    pred       = 1 if prob >= threshold else 0
-    confidence = prob if pred == 1 else (1.0 - prob)
-
-    return {
-        "probability":     round(prob, 6),
-        "prediction":      pred,
-        "confidence":      round(confidence, 6),
-        "risk_score":      round(prob * 100, 2),
-        "status":          "Theft" if pred == 1 else "Normal",
-        "label":           "Electricity Theft Detected" if pred == 1 else "Normal Customer",
-        "threshold_used":  threshold,
-        "model_name":      state.model_name,
-        "model_path":      state.model_path,
-        "tensorflow_version": tf.__version__,
-        "keras_version":   keras.__version__,
-        "predict_proof":   f"model.predict(x) where x.shape == {r2d.reshape(1,26,1).shape}",
-    }
+    """Compat shim → predict_one()."""
+    return predict_one(readings, strategy="last_n", threshold=threshold)
