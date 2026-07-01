@@ -778,12 +778,13 @@ def to_pdf(title, info, summary, metrics, df):
            Spacer(1, .6 * cm)]
 
     def tbl(t, pairs):
+        nonlocal el
         el.append(Paragraph(f"<b>{t}</b>", s["Heading2"]))
         table = Table([[str(k), str(v)] for k, v in pairs], colWidths=[7 * cm, 9 * cm])
         table.setStyle(TableStyle([("GRID", (0, 0), (-1, -1), .5, colors.grey),
             ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#1e293b")),
             ("TEXTCOLOR", (0, 0), (0, -1), colors.white), ("FONTSIZE", (0, 0), (-1, -1), 9)]))
-        el += [table, Spacer(1, .5 * cm)]
+        el.extend([table, Spacer(1, .5 * cm)])
 
     tbl("Model Information", [("Active Model", info.get("name", "—")),
         ("Architecture", info.get("architecture", "—")), ("Input Shape", info.get("input_shape", "—")),
@@ -1110,10 +1111,15 @@ def page_batch():
     hero("📦 Batch Prediction", "Upload a dataset and score every customer.")
     if not require_model():
         return
-    src = st.radio("Data source", ["Upload file", "Use bundled sample"], horizontal=True)
+    saved_ds = get_setting("active_dataset_path")
+    has_saved = bool(saved_ds and Path(saved_ds).exists())
+    options = ["Upload file"] + (["Use saved dataset"] if has_saved else []) + ["Use bundled sample"]
+    src = st.radio("Data source", options, horizontal=True)
     file = None
     if src == "Upload file":
         file = st.file_uploader("CSV or Excel", type=["csv", "xlsx", "xls"])
+    elif src == "Use saved dataset":
+        file = saved_ds; st.caption(f"Using saved dataset `{Path(saved_ds).name}`")
     elif SAMPLE_DATASET.exists():
         file = str(SAMPLE_DATASET); st.caption(f"Using `{SAMPLE_DATASET.name}`")
     if not file:
@@ -1264,29 +1270,61 @@ def page_settings():
 
     st.divider()
     st.markdown("### Upload / Replace Model")
+    # Show a persisted result from the previous run (survives the rerun).
+    if ss.get("model_msg"):
+        kind, m = ss.pop("model_msg")
+        callout(kind, m)
     up = st.file_uploader("CNN-LSTM model (.keras / .h5)", type=["keras", "h5"])
-    if up and st.button("Activate uploaded model", type="primary"):
-        path = UPLOAD_DIR / up.name
-        path.write_bytes(up.getbuffer())
-        try:
-            unload_model(); load_model(str(path), up.name)
-            set_setting("active_model_path", str(path)); st.cache_resource.clear()
-            st.success(f"Activated **{up.name}**.", icon="✅"); st.rerun()
-        except Exception as e:
-            st.error(f"Rejected: {e}")
-    if info.get("loaded") and Path(info["path"]) != DEFAULT_MODEL and st.button("Restore default model"):
-        unload_model(); set_setting("active_model_path", None)
-        auto_load_default(); st.cache_resource.clear(); st.rerun()
+    if up is not None:
+        if st.button("Activate uploaded model", type="primary", use_container_width=True):
+            path = UPLOAD_DIR / up.name
+            try:
+                path.write_bytes(up.getbuffer())
+                # Load+validate the NEW model first. load_model() only overwrites
+                # the engine state on success, so a rejected file never leaves the
+                # app without a working model.
+                load_model(str(path), up.name)
+                set_setting("active_model_path", str(path))
+                ss.model_msg = ("ok", f"Activated <b>{up.name}</b> — "
+                                      f"{model_info()['total_params_fmt']} params, "
+                                      f"{model_info()['architecture']}.")
+                st.cache_resource.clear()
+                st.rerun()
+            except Exception as e:
+                # Engine state is untouched on failure — current model stays active.
+                callout("err", f"Rejected: {e}")
+    if info.get("loaded") and Path(info["path"]) != DEFAULT_MODEL:
+        if st.button("Restore default model", use_container_width=True):
+            unload_model()
+            set_setting("active_model_path", None)
+            auto_load_default()
+            ss.model_msg = ("ok", f"Restored default model <b>{DEFAULT_MODEL.name}</b>.")
+            st.cache_resource.clear()
+            st.rerun()
 
     st.divider()
     st.markdown("### Dataset")
-    ds = st.file_uploader("Upload a dataset to persist as the working set", type=["csv", "xlsx", "xls"], key="ds_up")
-    if ds and st.button("Save dataset"):
-        path = UPLOAD_DIR / ds.name
-        path.write_bytes(ds.getbuffer()); set_setting("active_dataset_path", str(path))
-        st.success(f"Saved `{ds.name}`. Use it in Batch Prediction.", icon="✅")
+    if ss.get("ds_msg"):
+        kind, m = ss.pop("ds_msg")
+        callout(kind, m)
+    ds = st.file_uploader("Upload a dataset to use as the working set", type=["csv", "xlsx", "xls"], key="ds_up")
+    if ds is not None and st.button("Save dataset", type="primary", use_container_width=True):
+        try:
+            path = UPLOAD_DIR / ds.name
+            path.write_bytes(ds.getbuffer())
+            # quick validation so the user gets immediate feedback
+            _pv = inspect(read_table(str(path)))
+            set_setting("active_dataset_path", str(path))
+            ss.ds_msg = ("ok", f"Saved <b>{ds.name}</b> — {_pv['n_rows']:,} rows, "
+                               f"{_pv['n_readings']} reading columns. "
+                               f"Open <b>📦 Batch Prediction → “Use saved dataset”</b> to score it.")
+            st.rerun()
+        except Exception as e:
+            ss.ds_msg = ("err", f"Could not read dataset: {e}")
+            st.rerun()
     active_ds = get_setting("active_dataset_path")
-    st.caption(f"Active dataset: `{Path(active_ds).name if active_ds else 'bundled sample'}`")
+    valid_ds = bool(active_ds and Path(active_ds).exists())
+    st.caption(f"Active saved dataset: `{Path(active_ds).name if valid_ds else 'none — bundled sample in Batch'}`")
 
     st.divider()
     st.markdown("### Defaults & Theme")
