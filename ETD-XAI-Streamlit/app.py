@@ -780,12 +780,13 @@ def to_pdf(title, info, summary, metrics, df):
            Spacer(1, .6 * cm)]
 
     def tbl(t, pairs):
+        nonlocal el
         el.append(Paragraph(f"<b>{t}</b>", s["Heading2"]))
         table = Table([[str(k), str(v)] for k, v in pairs], colWidths=[7 * cm, 9 * cm])
         table.setStyle(TableStyle([("GRID", (0, 0), (-1, -1), .5, colors.grey),
             ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#1e293b")),
             ("TEXTCOLOR", (0, 0), (0, -1), colors.white), ("FONTSIZE", (0, 0), (-1, -1), 9)]))
-        el += [table, Spacer(1, .5 * cm)]
+        el.extend([table, Spacer(1, .5 * cm)])
 
     tbl("Model Information", [("Active Model", info.get("name", "—")),
         ("Architecture", info.get("architecture", "—")), ("Input Shape", info.get("input_shape", "—")),
