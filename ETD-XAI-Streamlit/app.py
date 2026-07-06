@@ -418,6 +418,93 @@ def model_info() -> dict:
     }
 
 
+# ── v3.0: config-driven, dynamic model registry ──────────────────────────────
+MODEL_CONFIG = ASSETS / "model_config.json"
+
+
+def load_config() -> dict:
+    """Single source of truth (assets/model_config.json). Backward compatible:
+    if absent, synthesise defaults from the loaded model so old projects work."""
+    if MODEL_CONFIG.exists():
+        try:
+            return json.loads(MODEL_CONFIG.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    # Fallback defaults (never hard-coded elsewhere) — derived from the model.
+    return {
+        "SEQ_LEN": E.seq_len, "N_STAT": E.stat_size,
+        "base_model": {"file": DEFAULT_MODEL.name, "best_thr": 0.5},
+        "_source": "auto-generated (no model_config.json found)",
+    }
+
+
+def config_threshold() -> float:
+    """Active threshold from config (per active model). Falls back to 0.5 only
+    when no configuration exists."""
+    cfg = load_config()
+    # match config entry to the active model file name
+    name = E.name
+    for key in ("base_model", "tl_model"):
+        m = cfg.get(key)
+        if isinstance(m, dict) and m.get("file") == name and m.get("best_thr") is not None:
+            return float(m["best_thr"])
+    if isinstance(cfg.get("best_thr"), (int, float)):
+        return float(cfg["best_thr"])
+    return 0.5
+
+
+def discover_models() -> list:
+    """Dynamically discover every .keras/.h5 model in assets/ and uploads/."""
+    seen, out = set(), []
+    for d in (ASSETS, UPLOAD_DIR):
+        if not d.exists():
+            continue
+        for p in sorted(list(d.glob("*.keras")) + list(d.glob("*.h5"))):
+            if p.name in seen:
+                continue
+            seen.add(p.name)
+            cfg = load_config()
+            meta = {}
+            for key in ("base_model", "tl_model"):
+                m = cfg.get(key)
+                if isinstance(m, dict) and m.get("file") == p.name:
+                    meta = m
+            out.append({
+                "name": p.name, "path": str(p),
+                "size_mb": round(p.stat().st_size / 1e6, 2),
+                "modified": datetime.fromtimestamp(p.stat().st_mtime).strftime("%Y-%m-%d %H:%M"),
+                "threshold": meta.get("best_thr"), "auc": meta.get("auc"),
+                "f1": meta.get("f1"), "accuracy": meta.get("accuracy"),
+                "active": (p.name == E.name),
+            })
+    return out
+
+
+def compatibility_report(uploaded_len: Optional[int] = None) -> dict:
+    """Full compatibility snapshot for the Settings panel (never mutates data)."""
+    import keras as _k
+    cfg = load_config()
+    rep = {
+        "model_loaded": is_loaded(),
+        "input_count": len(E.model.inputs) if E.model is not None else 0,
+        "sequence_input": str(E.input_shape),
+        "time_dim": ("dynamic (None)" if E.seq_len is None else f"fixed ({E.seq_len})"),
+        "stat_features_expected": E.stat_size,
+        "threshold": config_threshold(),
+        "config_source": cfg.get("_source", str(MODEL_CONFIG.name)),
+        "config_seq_len": cfg.get("SEQ_LEN"),
+        "config_n_stat": cfg.get("N_STAT"),
+        "tf_version": tf().__version__,
+        "keras_version": getattr(_k, "__version__", "unknown"),
+        "scaler": ("training stat_scaler.pkl" if PIPELINE.using_saved_scaler
+                   else "MISSING — re-fit per batch (inference may not match training)"),
+    }
+    if uploaded_len is not None:
+        rep["uploaded_len"] = uploaded_len
+        rep["length_match"] = (E.seq_len is None or uploaded_len == E.seq_len)
+    return rep
+
+
 def check_compatibility(uploaded_len: int) -> dict:
     if E.model is None:
         return {"compatible": False, "reason": NO_MODEL_MSG}
@@ -932,7 +1019,9 @@ if not is_loaded():
 
 ss = st.session_state
 ss.setdefault("theme", get_setting("theme", "dark"))
-ss.setdefault("threshold", float(get_setting("threshold", 0.5)))
+# v3.0: threshold defaults from model_config.json (per active model), not 0.5.
+_cfg_thr = config_threshold() if is_loaded() else 0.5
+ss.setdefault("threshold", float(get_setting("threshold", _cfg_thr)))
 ss.setdefault("strategy", get_setting("strategy", "last_n"))
 ss.setdefault("chat", [])
 ss.setdefault("manual_text", "")
@@ -1293,15 +1382,35 @@ def page_batch():
     c = st.columns(4)
     c[0].metric("Rows", f"{info['n_rows']:,}"); c[1].metric("Reading cols", info["n_readings"])
     c[2].metric("ID column", info["id_col"] or "auto"); c[3].metric("FLAG", "yes ✅" if info["has_flag"] else "no")
-    comp = check_compatibility(info["n_readings"])
-    (st.success if comp["compatible"] else st.error)(comp["reason"], icon="ℹ️")
-    strat = strategy_selector("b_strat")
-    thr = st.slider("Decision threshold", 0.0, 1.0, ss.threshold, 0.01, key="b_thr")
+    # v3.0 safety: never silently reshape. Fixed-length model + mismatch => require opt-in.
+    T = E.seq_len
+    mismatch = (T is not None and info["n_readings"] != T)
+    if T is None:
+        callout("ok", f"Model accepts <b>variable-length</b> input — the uploaded "
+                      f"{info['n_readings']} readings are sent <b>exactly as-is</b> (no resizing).")
+        allow_resize, strat = True, "last_n"
+    elif not mismatch:
+        callout("ok", f"Uploaded length <b>{info['n_readings']}</b> matches the model "
+                      f"exactly — data sent as-is, no resizing.")
+        allow_resize, strat = True, "last_n"
+    else:
+        callout("warn", f"Model expects a <b>fixed {T}</b>-reading sequence but the dataset "
+                        f"has <b>{info['n_readings']}</b>. Prediction is blocked unless you "
+                        f"explicitly choose a resize strategy below (this modifies your data).")
+        allow_resize = st.checkbox("I understand — apply a resize strategy (modifies uploaded data)",
+                                   value=False, key="b_allow")
+        strat = strategy_selector("b_strat") if allow_resize else "last_n"
+    thr = st.slider("Decision threshold", 0.0, 1.0, ss.threshold, 0.01, key="b_thr",
+                    help=f"Config default for this model: {config_threshold():.2f}")
     st.dataframe(df.head(8), use_container_width=True)
     c1, c2 = st.columns(2)
-    run = c1.button("⚡ Run Predictions", type="primary", use_container_width=True)
+    run = c1.button("⚡ Run Predictions", type="primary", use_container_width=True,
+                    disabled=(mismatch and not allow_resize))
     save = c2.checkbox("Save to database", value=True)
     if not run:
+        return
+    if mismatch and not allow_resize:
+        callout("err", "Blocked: length mismatch and no resize strategy selected.")
         return
     if info["n_readings"] < 2:
         st.error("No usable reading columns (need ≥ 2 numeric)."); return
@@ -1428,6 +1537,39 @@ def page_settings():
     else:
         st.markdown('<span class="badge badge-theft">🔴 Status: Not Loaded</span>', unsafe_allow_html=True)
         st.error(NO_MODEL_MSG, icon="🚫")
+
+    # ── v3.0: Dynamic Model Registry ─────────────────────────────────────────
+    st.divider()
+    st.markdown("### 🗂️ Model Registry (auto-discovered)")
+    reg = discover_models()
+    if reg:
+        st.dataframe(pd.DataFrame(reg)[["name", "size_mb", "modified", "threshold",
+                                        "auc", "f1", "accuracy", "active"]],
+                     use_container_width=True, hide_index=True)
+        names = [m["name"] for m in reg]
+        cur = next((i for i, m in enumerate(reg) if m["active"]), 0)
+        pick = st.selectbox("Active model", names, index=cur, key="reg_pick")
+        if pick != E.name and st.button("Activate selected model", type="primary"):
+            path = next(m["path"] for m in reg if m["name"] == pick)
+            try:
+                load_model(path, pick)
+                set_setting("active_model_path", path)
+                ss.threshold = config_threshold()  # auto-update threshold from config
+                ss.model_msg = ("ok", f"Activated <b>{pick}</b> — threshold auto-set to "
+                                      f"{config_threshold():.2f}, seq_len {E.seq_len}.")
+                st.cache_resource.clear(); st.rerun()
+            except Exception as e:
+                callout("err", f"Rejected: {e}")
+    else:
+        callout("info", "No models found in assets/ or uploads/.")
+
+    # ── v3.0: Compatibility & configuration panel ────────────────────────────
+    st.markdown("### 🔧 Compatibility & Configuration")
+    st.json(compatibility_report())
+    if not PIPELINE.using_saved_scaler:
+        callout("warn", "Training scaler <code>assets/stat_scaler.pkl</code> not found — "
+                        "features are re-fit per batch, so <b>inference may not match training</b>. "
+                        "Add the notebook's stat_scaler.pkl for exact parity.")
 
     st.divider()
     st.markdown("### Upload / Replace Model")
