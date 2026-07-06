@@ -431,9 +431,32 @@ def model_info() -> dict:
 MODEL_CONFIG = ASSETS / "model_config.json"
 
 
+def _model_stem() -> str:
+    return Path(E.name).stem if E.name else ""
+
+
+def _model_schema_path(suffix: str) -> Path:
+    """assets/<active-model-stem>_<suffix>.json — e.g. base_cnnlstm_final_config.json,
+    base_cnnlstm_final_training_columns.json. Lets each model ship its own schema
+    (Section 11) without any code change; falls back to the shared config/dates
+    when a dedicated file doesn't exist for the active model."""
+    return ASSETS / f"{_model_stem()}_{suffix}.json"
+
+
 def load_config() -> dict:
-    """Single source of truth (assets/model_config.json). Backward compatible:
-    if absent, synthesise defaults from the loaded model so old projects work."""
+    """Source of truth for metadata/threshold/training info. Resolution order:
+    1) a per-model dedicated file  assets/<model-stem>_config.json  (future-proof:
+       drop one in for any new model, no code change needed)
+    2) the shared assets/model_config.json (current models)
+    3) synthesised defaults derived from the loaded TF model (old projects)."""
+    per_model = _model_schema_path("config")
+    if per_model.exists():
+        try:
+            d = json.loads(per_model.read_text(encoding="utf-8"))
+            d.setdefault("_source", per_model.name)
+            return d
+        except Exception:
+            pass
     if MODEL_CONFIG.exists():
         try:
             return json.loads(MODEL_CONFIG.read_text(encoding="utf-8"))
@@ -445,6 +468,22 @@ def load_config() -> dict:
         "base_model": {"file": DEFAULT_MODEL.name, "best_thr": 0.5},
         "_source": "auto-generated (no model_config.json found)",
     }
+
+
+def training_columns() -> Optional[list]:
+    """Per-model exact training column list (Section 11), e.g.
+    assets/<model-stem>_training_columns.json = ["01/01/2014", ..., "CONS_NO", "FLAG"].
+    Returns None when no dedicated schema exists for the active model — callers
+    then fall back to the generic date-sequence template."""
+    p = _model_schema_path("training_columns")
+    if p.exists():
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+            if isinstance(data, list) and data:
+                return [str(c) for c in data]
+        except Exception:
+            pass
+    return None
 
 
 def config_threshold() -> float:
@@ -537,7 +576,18 @@ def compatibility_report(uploaded_len: Optional[int] = None) -> dict:
     if uploaded_len is not None:
         rep["uploaded_len"] = uploaded_len
         rep["✓ compatible_dataset"] = (E.seq_len is None or uploaded_len == E.seq_len)
+
+    # Overall Compatibility % — weighted readiness score (Section 9).
+    checks = [rep["✓ model_loaded"], PIPELINE.using_saved_scaler, MODEL_CONFIG.exists() or per_model_cfg_exists(),
+              not conflicts, rep["✓ prediction_ready"]]
+    if uploaded_len is not None:
+        checks.append(rep["✓ compatible_dataset"])
+    rep["✓ overall_compatibility_pct"] = round(100 * sum(bool(c) for c in checks) / len(checks))
     return rep
+
+
+def per_model_cfg_exists() -> bool:
+    return _model_schema_path("config").exists()
 
 
 def check_compatibility(uploaded_len: int) -> dict:
@@ -708,6 +758,9 @@ def run_batch(df, info, strategy="last_n", threshold=0.5) -> dict:
 import datetime as _dt
 
 
+COMMON_SEQ_LENGTHS = [120, 180, 240, 350, 365, 730]
+
+
 def _template_seq_len() -> int:
     """Active sequence length — TensorFlow model is authoritative, else config,
     else the original 120-day training default. Never hardcoded elsewhere."""
@@ -718,9 +771,15 @@ def _template_seq_len() -> int:
 
 
 def _template_dates(n: int) -> list:
-    """Sequential calendar-day column headers, driven by model_config.json's
-    START_DATE/DATE_FORMAT when present (Feature 11), else the training default
-    (01/01/2014, MM/DD/YYYY — matches the notebook's 120-day format)."""
+    """Reading-column headers for a template of length n. Uses the active
+    model's own training_columns.json schema when one exists (Section 11);
+    otherwise generates sequential calendar days from model_config.json's
+    START_DATE/DATE_FORMAT (default 01/01/2014, MM/DD/YYYY)."""
+    cols = training_columns()
+    if cols:
+        readings = [c for c in cols if str(c).strip().lower() not in ID_COLS | FLAG_COLS]
+        if len(readings) == n:
+            return readings
     cfg = load_config()
     start_str = cfg.get("START_DATE", "01/01/2014")
     fmt = cfg.get("DATE_FORMAT", "%m/%d/%Y")
@@ -731,11 +790,13 @@ def _template_dates(n: int) -> list:
     return [(start + _dt.timedelta(days=i)).strftime(fmt) for i in range(n)]
 
 
-def build_template_df(include_flag: bool, n_examples: int = 3) -> pd.DataFrame:
+def build_template_df(include_flag: bool, n_examples: int = 3, n_override: Optional[int] = None) -> pd.DataFrame:
     """Construct a template dataframe with realistic example readings.
-    Column order: date columns first, then CONS_NO, then FLAG (if requested) —
-    matching the exact training file layout. Deterministic (fixed seed)."""
-    n = _template_seq_len()
+    Column order: reading columns first, then CONS_NO, then FLAG (if requested) —
+    matching the exact training file layout. Deterministic (fixed seed).
+    n_override lets variable-length models generate a template of any chosen
+    length (120/180/240/350/365/730/custom) without touching the active model."""
+    n = int(n_override) if n_override else _template_seq_len()
     dates = _template_dates(n)
     rng = np.random.default_rng(42)
     rows = []
@@ -755,31 +816,46 @@ def build_template_df(include_flag: bool, n_examples: int = 3) -> pd.DataFrame:
 
 def render_dataset_templates(show_all: bool = True):
     """'Dataset Templates' UI section — Production / Evaluation / Empty
-    downloads, dynamically generated from the active model's sequence length."""
+    downloads, dynamically generated from the active model's sequence length.
+    For variable-length models, lets the user pick the template length instead
+    of assuming one fixed size (Section 2)."""
+    variable = is_loaded() and E.seq_len is None
     n = _template_seq_len()
+    if variable:
+        options = COMMON_SEQ_LENGTHS + ["Custom…"]
+        choice = st.selectbox("Template length (model accepts any length)", options,
+                              index=0, key="tmpl_len_choice")
+        if choice == "Custom…":
+            n = st.number_input("Custom sequence length", min_value=2, max_value=2000,
+                                value=120, step=1, key="tmpl_len_custom")
+        else:
+            n = int(choice)
     st.markdown("#### Dataset Templates")
-    st.caption(f"Templates are generated for the active configuration: **{n} daily readings**.")
+    st.caption(f"Templates are generated for **{n} daily readings**"
+              + (" (variable-length model — choose any size above)." if variable else "."))
     if show_all:
         c = st.columns(3)
         with c[0]:
             st.markdown("**Production**")
             st.caption("Real customer readings, no ground truth. Use this for actual predictions.")
-            st.download_button("📥 Download Production Template", to_csv(build_template_df(False)),
-                               "production_template.csv", "text/csv", use_container_width=True)
+            st.download_button("📥 Download Production Template",
+                               to_csv(build_template_df(False, n_override=n)),
+                               f"production_template_{n}.csv", "text/csv", use_container_width=True)
         with c[1]:
             st.markdown("**Evaluation**")
             st.caption("Includes FLAG ground truth, for measuring accuracy/precision/recall.")
-            st.download_button("📥 Download Evaluation Template", to_csv(build_template_df(True)),
-                               "evaluation_template.csv", "text/csv", use_container_width=True)
+            st.download_button("📥 Download Evaluation Template",
+                               to_csv(build_template_df(True, n_override=n)),
+                               f"evaluation_template_{n}.csv", "text/csv", use_container_width=True)
         with c[2]:
             st.markdown("**Empty**")
             st.caption("Header row only — fill in your own customers and readings.")
-            empty_df = build_template_df(False, n_examples=0)
+            empty_df = build_template_df(False, n_examples=0, n_override=n)
             st.download_button("📥 Download Empty Template", to_csv(empty_df),
-                               "empty_template.csv", "text/csv", use_container_width=True)
+                               f"empty_template_{n}.csv", "text/csv", use_container_width=True)
     else:
-        st.download_button("📥 Download CSV Template", to_csv(build_template_df(False)),
-                           "prediction_template.csv", "text/csv", use_container_width=True)
+        st.download_button("📥 Download CSV Template", to_csv(build_template_df(False, n_override=n)),
+                           f"prediction_template_{n}.csv", "text/csv", use_container_width=True)
         st.caption(f"{n} daily readings + customer ID — fill in your data and upload it above.")
 
 
@@ -787,22 +863,27 @@ def validate_dataset_report(df: pd.DataFrame, info: dict) -> list:
     """Smart validation checks (Feature 6/7) — read-only, does not alter df.
     Returns a list of (kind, message) for display via callout()."""
     checks = []
-    n = _template_seq_len()
-    expected_dates = set(_template_dates(n))
-    cols = [str(c) for c in df.columns]
-    date_like_cols = {c for c in cols if c in expected_dates}
-    missing = sorted(expected_dates - date_like_cols)
-    extra = [c for c in cols if c not in expected_dates
-             and str(c).strip().lower() not in ID_COLS | FLAG_COLS]
-
-    if info["n_readings"] == n and not missing:
-        checks.append(("ok", "Dataset format matches the active configuration."))
-    if missing:
-        checks.append(("warn", f"Missing expected reading column(s): {', '.join(missing[:5])}"
-                              + (f" … (+{len(missing)-5} more)" if len(missing) > 5 else "")))
-    if extra:
-        checks.append(("warn", f"Extra/unrecognised column(s) detected: {', '.join(map(str, extra[:5]))}"
-                              + (f" … (+{len(extra)-5} more)" if len(extra) > 5 else "")))
+    variable = is_loaded() and E.seq_len is None
+    if variable:
+        # No fixed expected column set — any length is valid (Section 6).
+        checks.append(("ok", f"Variable-length model — {info['n_readings']} reading column(s) "
+                             f"detected and will be used exactly as uploaded (no resizing)."))
+    else:
+        n = _template_seq_len()
+        expected_dates = set(_template_dates(n))
+        cols = [str(c) for c in df.columns]
+        date_like_cols = {c for c in cols if c in expected_dates}
+        missing = sorted(expected_dates - date_like_cols)
+        extra = [c for c in cols if c not in expected_dates
+                 and str(c).strip().lower() not in ID_COLS | FLAG_COLS]
+        if info["n_readings"] == n and not missing:
+            checks.append(("ok", "Dataset format matches the active configuration."))
+        if missing:
+            checks.append(("warn", f"Missing expected reading column(s): {', '.join(missing[:5])}"
+                                  + (f" … (+{len(missing)-5} more)" if len(missing) > 5 else "")))
+        if extra:
+            checks.append(("warn", f"Extra/unrecognised column(s) detected: {', '.join(map(str, extra[:5]))}"
+                                  + (f" … (+{len(extra)-5} more)" if len(extra) > 5 else "")))
     if info["id_col"]:
         dup = df[info["id_col"]].duplicated().sum()
         if dup:
@@ -827,18 +908,29 @@ def validate_dataset_report(df: pd.DataFrame, info: dict) -> list:
 
 
 def render_dataset_preview(df: pd.DataFrame, info: dict):
-    """Feature 9 — dataset preview card (customers, readings, dates, flags, quality)."""
-    n = _template_seq_len()
+    """Feature 9 / Section 8 — dataset summary (customers, readings, date range,
+    quality, FLAG distribution) + first 5 rows."""
+    variable = is_loaded() and E.seq_len is None
     dataset_type = "Training/Evaluation Dataset" if info["has_flag"] else "Production Dataset"
-    date_cols = [c for c in info["reading_cols"] if str(c) in set(_template_dates(n))]
-    start_d = date_cols[0] if date_cols else (info["reading_cols"][0] if info["reading_cols"] else "—")
-    end_d = date_cols[-1] if date_cols else (info["reading_cols"][-1] if info["reading_cols"] else "—")
+    if variable:
+        start_d = info["reading_cols"][0] if info["reading_cols"] else "—"
+        end_d = info["reading_cols"][-1] if info["reading_cols"] else "—"
+    else:
+        n = _template_seq_len()
+        date_cols = [c for c in info["reading_cols"] if str(c) in set(_template_dates(n))]
+        start_d = date_cols[0] if date_cols else (info["reading_cols"][0] if info["reading_cols"] else "—")
+        end_d = date_cols[-1] if date_cols else (info["reading_cols"][-1] if info["reading_cols"] else "—")
     c = st.columns(4)
     with c[0]: kpi("Customers", f"{info['n_rows']:,}", icon="")
     with c[1]: kpi("Readings", info["n_readings"], icon="")
     with c[2]: kpi("Dataset Type", dataset_type.split()[0], dataset_type, icon="")
     with c[3]: kpi("Missing values", f"{int(df.isna().sum().sum()):,}", icon="")
-    st.caption(f"Date range: **{start_d}** → **{end_d}** · "
+    if info["flag_col"]:
+        flags = pd.to_numeric(df[info["flag_col"]], errors="coerce").fillna(0).astype(int)
+        c2 = st.columns(2)
+        with c2[0]: kpi("Normal Count", f"{int((flags == 0).sum()):,}", "FLAG = 0", "#16a34a")
+        with c2[1]: kpi("Theft Count", f"{int((flags == 1).sum()):,}", "FLAG = 1", "#dc2626")
+    st.caption(f"Reading range: **{start_d}** → **{end_d}** · "
               f"Duplicate IDs: **{int(df[info['id_col']].duplicated().sum()) if info['id_col'] else 0}** · "
               f"Ground truth (FLAG): **{'present' if info['has_flag'] else 'not present'}**")
     st.dataframe(df.head(5), use_container_width=True)
@@ -1619,14 +1711,25 @@ def page_batch():
     st.markdown("##### Validation Report")
     for kind, msg in validate_dataset_report(df, info):
         callout(kind, msg)
-    # v3.0 safety: never silently reshape. Fixed-length model + mismatch => require opt-in.
+
+    with st.expander("🔧 Compatibility Panel", expanded=False):
+        rep = compatibility_report(info["n_readings"])
+        st.json(rep)
+        st.progress(rep["✓ overall_compatibility_pct"] / 100,
+                   text=f"Overall Compatibility: {rep['✓ overall_compatibility_pct']}%")
+
+    # Section 5/6/7 — never silently reshape. Fixed-length model + mismatch
+    # => prediction is BLOCKED unless the user explicitly opts into ONE resize
+    # strategy (OFF by default). Variable-length model => data always as-is.
     T = E.seq_len
     mismatch = (T is not None and info["n_readings"] != T)
     if T is None:
+        integrity_note = "✓ Variable-length model — original data used, no modification."
         callout("ok", f"Model accepts <b>variable-length</b> input — the uploaded "
                       f"{info['n_readings']} readings are sent <b>exactly as-is</b> (no resizing).")
         allow_resize, strat = True, "last_n"
     elif not mismatch:
+        integrity_note = "✓ Fixed-length model — uploaded length matches exactly, original data used."
         callout("ok", f"Uploaded length <b>{info['n_readings']}</b> matches the model "
                       f"exactly — data sent as-is, no resizing.")
         allow_resize, strat = True, "last_n"
@@ -1634,13 +1737,18 @@ def page_batch():
         callout("err", f"<b>Incompatible dataset.</b><br>Uploaded sequence length: "
                        f"<b>{info['n_readings']}</b><br>Model expects: <b>{T}</b><br>"
                        f"Prediction aborted.")
-        st.caption("You may optionally choose ONE preprocessing strategy manually to proceed "
-                   "(this modifies your uploaded data — automatic preprocessing is disabled).")
-        allow_resize = st.checkbox("I explicitly approve applying a resize strategy",
+        allow_resize = st.checkbox("Enable Compatibility Resize (OFF by default)",
                                    value=False, key="b_allow")
-        strat = strategy_selector("b_strat") if allow_resize else "last_n"
+        if allow_resize:
+            callout("warn", "This changes the original data and may affect prediction accuracy.")
+            strat = strategy_selector("b_strat")
+            integrity_note = f"✓ Resized by user request — strategy: {STRATEGY_LABELS[strat]}."
+        else:
+            strat = "last_n"
+            integrity_note = "✗ Incompatible dataset — prediction aborted (no resize applied)."
     thr = st.slider("Decision threshold", 0.0, 1.0, ss.threshold, 0.01, key="b_thr",
                     help=f"Config default for this model: {config_threshold():.2f}")
+    callout("info" if "✓" in integrity_note else "err", integrity_note, "Data integrity")
     c1, c2 = st.columns(2)
     run = c1.button("⚡ Run Predictions", type="primary", use_container_width=True,
                     disabled=(mismatch and not allow_resize))
