@@ -174,18 +174,51 @@ def extract_features(readings: np.ndarray) -> np.ndarray:
 
 
 class FeaturePipeline:
-    """StandardScaler fitted per uploaded batch (training scaler was not saved)."""
+    """StandardScaler fitted ONCE on the bundled sample dataset at model-load
+    time, then reused identically for every manual and batch prediction.
+    This guarantees that the same customer always produces the same statistical
+    tensor regardless of which other customers appear in an uploaded batch.
+    """
     def __init__(self):
         self._scaler: Optional[StandardScaler] = None
         self._fitted = False
 
-    def fit_transform(self, readings: np.ndarray) -> np.ndarray:
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+    def _fit(self, readings: np.ndarray) -> None:
+        """Fit the scaler on *readings* (N, T) without returning anything."""
         raw = extract_features(readings)
         self._scaler = StandardScaler()
-        out = np.nan_to_num(self._scaler.fit_transform(raw).astype(np.float32))
+        self._scaler.fit(raw)
         self._fitted = True
-        return out
 
+    def fit_on_sample(self, sample_path: Path) -> bool:
+        """Fit the scaler on the bundled sample_dataset.csv so that a fixed,
+        reproducible normalisation is available for both manual and batch
+        predictions.  Returns True on success, False if the file is missing."""
+        try:
+            df = pd.read_csv(sample_path)
+            id_like = {"cons_no", "customer_id", "id", "customer",
+                       "consumer_no", "meter_id", "user_id", "flag",
+                       "label", "target", "theft", "is_theft", "class", "y"}
+            num_cols = [c for c in df.columns
+                        if str(c).strip().lower() not in id_like
+                        and pd.to_numeric(df[c], errors="coerce").notna().mean() >= 0.5]
+            readings = (df[num_cols]
+                        .apply(pd.to_numeric, errors="coerce")
+                        .fillna(0.0)
+                        .to_numpy(np.float32))
+            if len(readings) < 2:
+                return False
+            self._fit(readings)
+            return True
+        except Exception:
+            return False
+
+    # ------------------------------------------------------------------
+    # Public API — always uses the fixed scaler from fit_on_sample()
+    # ------------------------------------------------------------------
     def transform(self, readings: np.ndarray) -> np.ndarray:
         raw = extract_features(readings)
         if self._fitted and self._scaler is not None:
@@ -193,6 +226,11 @@ class FeaturePipeline:
         else:
             out = np.zeros_like(raw)
         return np.nan_to_num(out)
+
+    # fit_transform kept for backwards compatibility (e.g. unit tests)
+    def fit_transform(self, readings: np.ndarray) -> np.ndarray:
+        self._fit(readings)
+        return self.transform(readings)
 
     def reset(self):
         self._scaler = None; self._fitted = False
@@ -332,6 +370,9 @@ def load_model(path: str, name: Optional[str] = None) -> dict:
     E.output_shape = tuple(model.output_shape)
     E.total_params = int(model.count_params())
     E.summary = buf.getvalue()
+    # Prime the global scaler once from the bundled reference dataset so that
+    # both manual and batch predictions share identical normalisation params.
+    PIPELINE.fit_on_sample(SAMPLE_DATASET)
     return model_info()
 
 
@@ -394,12 +435,15 @@ def check_compatibility(uploaded_len: int) -> dict:
                       f"A length-mapping strategy will be applied."}
 
 
-def _build_stat(ready_2d, fit_scaler):
+def _build_stat(ready_2d, fit_scaler=False):  # fit_scaler param kept for API compat but ignored
     raw = extract_features(ready_2d)
     if raw.shape[1] != E.stat_size:
         raise ValueError(f"Stat-feature mismatch: produced {raw.shape[1]}, model needs "
                          f"{E.stat_size}. Refusing to substitute zeros.")
-    return PIPELINE.fit_transform(ready_2d) if fit_scaler else PIPELINE.transform(ready_2d)
+    # Always use the fixed scaler primed from sample_dataset.csv at model-load
+    # time.  This eliminates the batch-composition dependency that caused
+    # manual and batch predictions to diverge for the same customer.
+    return PIPELINE.transform(ready_2d)
 
 
 def _raw_predict(seq_ready_2d, stat, batch_size):
@@ -524,7 +568,10 @@ def compute_metrics(flags, preds, probs) -> dict:
 
 def run_batch(df, info, strategy="last_n", threshold=0.5) -> dict:
     readings, ids, flags = build_matrix(df, info)
-    probs = predict_sequences(readings, strategy, threshold, fit_scaler=True)
+    # fit_scaler=False — the scaler was already primed on the reference dataset
+    # at model-load time; re-fitting on each uploaded batch was the root cause
+    # of manual vs batch prediction divergence.
+    probs = predict_sequences(readings, strategy, threshold, fit_scaler=False)
     rows = []
     for i, (cid, p) in enumerate(zip(ids, probs)):
         rows.append({"customer_id": cid, **classify(float(p), threshold),
