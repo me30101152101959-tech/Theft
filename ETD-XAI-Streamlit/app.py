@@ -175,18 +175,52 @@ def extract_features(readings: np.ndarray) -> np.ndarray:
     return np.nan_to_num(feats, nan=0.0, posinf=0.0, neginf=0.0)
 
 
+# Path to the TRAINING StandardScaler exported by the notebook (CELL 8/19:
+# joblib.dump(stat_scaler, 'stat_scaler.pkl')). If present, it is used verbatim
+# so inference matches training exactly. If absent, we fall back to per-batch
+# re-fitting (approximate) so the app still runs.
+SAVED_SCALER = ASSETS / "stat_scaler.pkl"
+
+
 class FeaturePipeline:
-    """StandardScaler fitted per uploaded batch (training scaler was not saved)."""
+    """
+    Stat-feature scaler. Prefers the SAVED training StandardScaler
+    (stat_scaler.pkl) for exact train/inference parity; otherwise re-fits
+    per batch as a documented approximation.
+    """
     def __init__(self):
         self._scaler: Optional[StandardScaler] = None
         self._fitted = False
+        self._locked = False          # True => using the saved training scaler
+        self._load_saved()
+
+    def _load_saved(self):
+        if SAVED_SCALER.exists():
+            try:
+                import joblib
+                sc = joblib.load(SAVED_SCALER)
+                # sanity: must expose transform and match the 59-feature vector
+                if hasattr(sc, "transform"):
+                    self._scaler = sc
+                    self._fitted = True
+                    self._locked = True
+            except Exception:
+                self._scaler = None; self._fitted = False; self._locked = False
+
+    @property
+    def using_saved_scaler(self) -> bool:
+        return self._locked
 
     def fit_transform(self, readings: np.ndarray) -> np.ndarray:
         raw = extract_features(readings)
-        self._scaler = StandardScaler()
-        out = np.nan_to_num(self._scaler.fit_transform(raw).astype(np.float32))
-        self._fitted = True
-        return out
+        if self._locked and self._scaler is not None:
+            # Never refit over the training scaler — transform only.
+            out = self._scaler.transform(raw).astype(np.float32)
+        else:
+            self._scaler = StandardScaler()
+            out = self._scaler.fit_transform(raw).astype(np.float32)
+            self._fitted = True
+        return np.nan_to_num(out)
 
     def transform(self, readings: np.ndarray) -> np.ndarray:
         raw = extract_features(readings)
@@ -197,6 +231,9 @@ class FeaturePipeline:
         return np.nan_to_num(out)
 
     def reset(self):
+        # Keep a saved training scaler across resets; only clear a batch-fit one.
+        if self._locked:
+            return
         self._scaler = None; self._fitted = False
 
 
@@ -1463,7 +1500,11 @@ def page_settings():
 
     st.divider()
     st.markdown("### Verification Status")
+    _scaler_state = ("training scaler stat_scaler.pkl (exact parity)"
+                     if PIPELINE.using_saved_scaler else
+                     "⚠️ re-fit per batch (approximate — add assets/stat_scaler.pkl for exact parity)")
     st.json({"model_loaded": info.get("loaded", False), "active_model": info.get("name"),
+             "stat_scaler": _scaler_state,
              "load_method": "tensorflow.keras.models.load_model(path)", "predict_method": "model.predict(x)",
              "exclusive_engine": True,
              "fallback_models": "none — CNN-LSTM only (no RF/XGBoost/LightGBM/CatBoost/LogReg/DT/SVM/KNN/rule/mock)",
