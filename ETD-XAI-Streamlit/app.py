@@ -38,7 +38,15 @@ os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
 
 APP_DIR = Path(__file__).resolve().parent
 ASSETS = APP_DIR / "assets"
-DEFAULT_MODEL = ASSETS / "cnnlstm_final.keras"
+# Default active model: prefer the config's base model, else the legacy filename
+# (kept for backward compatibility with older single-model projects).
+def _default_model_path() -> "Path":
+    for cand in ("base_cnnlstm_final.keras", "cnnlstm_final.keras"):
+        p = ASSETS / cand
+        if p.exists():
+            return p
+    return ASSETS / "cnnlstm_final.keras"
+DEFAULT_MODEL = _default_model_path()
 SAMPLE_DATASET = ASSETS / "sample_dataset.csv"
 LOGO = ASSETS / "logo.png"
 
@@ -484,24 +492,33 @@ def compatibility_report(uploaded_len: Optional[int] = None) -> dict:
     """Full compatibility snapshot for the Settings panel (never mutates data)."""
     import keras as _k
     cfg = load_config()
+    # Rule 4 — TensorFlow model is authoritative; warn if config disagrees.
+    cfg_seq, cfg_stat = cfg.get("SEQ_LEN"), cfg.get("N_STAT")
+    conflicts = []
+    if E.seq_len is not None and cfg_seq is not None and cfg_seq != E.seq_len:
+        conflicts.append(f"config SEQ_LEN={cfg_seq} ≠ model {E.seq_len} (using model)")
+    if cfg_stat is not None and cfg_stat != E.stat_size:
+        conflicts.append(f"config N_STAT={cfg_stat} ≠ model {E.stat_size} (using model)")
     rep = {
-        "model_loaded": is_loaded(),
-        "input_count": len(E.model.inputs) if E.model is not None else 0,
-        "sequence_input": str(E.input_shape),
-        "time_dim": ("dynamic (None)" if E.seq_len is None else f"fixed ({E.seq_len})"),
-        "stat_features_expected": E.stat_size,
-        "threshold": config_threshold(),
+        "✓ model_loaded": is_loaded(),
+        "✓ input_count": len(E.model.inputs) if E.model is not None else 0,
+        "✓ input_shape": str(E.input_shape),
+        "✓ output_shape": str(E.output_shape),
+        "✓ variable_length_support": ("Yes" if E.seq_len is None else "No"),
+        "✓ expected_sequence_length": ("any (variable)" if E.seq_len is None else E.seq_len),
+        "✓ stat_features_expected": E.stat_size,
+        "✓ threshold": config_threshold(),
+        "✓ active_scaler": ("training stat_scaler.pkl" if PIPELINE.using_saved_scaler
+                            else "MISSING — re-fit per batch (may not match training)"),
+        "✓ tf_version": tf().__version__,
+        "✓ keras_version": getattr(_k, "__version__", "unknown"),
         "config_source": cfg.get("_source", str(MODEL_CONFIG.name)),
-        "config_seq_len": cfg.get("SEQ_LEN"),
-        "config_n_stat": cfg.get("N_STAT"),
-        "tf_version": tf().__version__,
-        "keras_version": getattr(_k, "__version__", "unknown"),
-        "scaler": ("training stat_scaler.pkl" if PIPELINE.using_saved_scaler
-                   else "MISSING — re-fit per batch (inference may not match training)"),
+        "config_vs_model": ("consistent" if not conflicts else conflicts),
+        "✓ prediction_ready": is_loaded() and E.model is not None,
     }
     if uploaded_len is not None:
         rep["uploaded_len"] = uploaded_len
-        rep["length_match"] = (E.seq_len is None or uploaded_len == E.seq_len)
+        rep["✓ compatible_dataset"] = (E.seq_len is None or uploaded_len == E.seq_len)
     return rep
 
 
@@ -1394,10 +1411,12 @@ def page_batch():
                       f"exactly — data sent as-is, no resizing.")
         allow_resize, strat = True, "last_n"
     else:
-        callout("warn", f"Model expects a <b>fixed {T}</b>-reading sequence but the dataset "
-                        f"has <b>{info['n_readings']}</b>. Prediction is blocked unless you "
-                        f"explicitly choose a resize strategy below (this modifies your data).")
-        allow_resize = st.checkbox("I understand — apply a resize strategy (modifies uploaded data)",
+        callout("err", f"<b>Incompatible dataset.</b><br>Uploaded sequence length: "
+                       f"<b>{info['n_readings']}</b><br>Model expects: <b>{T}</b><br>"
+                       f"Prediction aborted.")
+        st.caption("You may optionally choose ONE preprocessing strategy manually to proceed "
+                   "(this modifies your uploaded data — automatic preprocessing is disabled).")
+        allow_resize = st.checkbox("I explicitly approve applying a resize strategy",
                                    value=False, key="b_allow")
         strat = strategy_selector("b_strat") if allow_resize else "last_n"
     thr = st.slider("Decision threshold", 0.0, 1.0, ss.threshold, 0.01, key="b_thr",
