@@ -30,6 +30,7 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
+import streamlit.components.v1 as components
 from scipy import stats as scipy_stats
 from scipy.stats import entropy
 from sklearn.preprocessing import StandardScaler
@@ -1931,8 +1932,76 @@ def do_logout():
     st.rerun()
 
 
+# Animated Three.js background for the login screen only (presentation-only —
+# no application logic). A glowing wireframe "AI core" behind the login card.
+_LOGIN_BG_HTML = """
+<!DOCTYPE html><html><head><meta charset="utf-8"/>
+<style>*{margin:0;padding:0;box-sizing:border-box}html,body{width:100%;height:100%;overflow:hidden;background:#05070d}</style>
+</head><body>
+<div id="tjs" style="width:100%;height:100%"></div>
+<script src="https://ajax.googleapis.com/ajax/libs/threejs/r125/three.min.js"></script>
+<script>
+(function() {
+  const container = document.getElementById('tjs');
+  const scene = new THREE.Scene();
+  const camera = new THREE.PerspectiveCamera(75, window.innerWidth/window.innerHeight, 0.1, 1000);
+  const renderer = new THREE.WebGLRenderer({ alpha: true, antialias: true });
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  container.appendChild(renderer.domElement);
+
+  const geometry = new THREE.IcosahedronGeometry(1, 4);
+  const material = new THREE.MeshPhongMaterial({
+      color: 0x2563eb, wireframe: true, emissive: 0x2563eb,
+      emissiveIntensity: 0.45, transparent: true, opacity: 0.55 });
+  const aiCore = new THREE.Mesh(geometry, material);
+  scene.add(aiCore);
+
+  const ringGeo = new THREE.TorusGeometry(1.5, 0.015, 16, 100);
+  const ringMat = new THREE.MeshBasicMaterial({ color: 0x2563eb, transparent: true, opacity: 0.28 });
+  const ring = new THREE.Mesh(ringGeo, ringMat);
+  scene.add(ring);
+
+  const light = new THREE.PointLight(0xffffff, 1, 100);
+  light.position.set(5, 5, 5);
+  scene.add(light);
+  camera.position.z = 4;
+
+  function animate() {
+      requestAnimationFrame(animate);
+      aiCore.rotation.y += 0.006;
+      aiCore.rotation.x += 0.003;
+      ring.rotation.z -= 0.003;
+      ring.rotation.y += 0.005;
+      aiCore.position.y = Math.sin(Date.now() * 0.0015) * 0.08;
+      renderer.render(scene, camera);
+  }
+  window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth/window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+  });
+  animate();
+})();
+</script>
+</body></html>
+"""
+
+
+def _login_background():
+    """Render the Three.js animation full-screen behind the login card."""
+    st.markdown("""<style>
+      div[data-testid="stIFrame"], div[data-testid="stIFrame"] iframe, iframe {
+        position:fixed !important; inset:0 !important; top:0 !important; left:0 !important;
+        width:100vw !important; height:100vh !important; z-index:0 !important; border:0 !important;
+      }
+    </style>""", unsafe_allow_html=True)
+    components.html(_LOGIN_BG_HTML, height=0)
+
+
 def login_view():
-    """Professional login card shown before the app is accessible."""
+    """Professional login card shown before the app is accessible, with a
+    subtle animated Three.js background."""
+    _login_background()
     _, mid, _ = st.columns([1, 1.1, 1])
     with mid:
         st.write("")
