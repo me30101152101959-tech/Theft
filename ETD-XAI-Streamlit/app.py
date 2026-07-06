@@ -1045,93 +1045,107 @@ ss.setdefault("manual_text", "")
 
 
 def _palette() -> dict:
-    """Theme tokens for both modes — single source of truth for all UI colors."""
+    """Enterprise theme tokens (few colors) — single source of truth for the UI.
+    Light = Stripe/Notion white; Dark = Grafana/Datadog slate."""
+    prim, ok, warn, err = "#2563eb", "#16a34a", "#d97706", "#dc2626"
     if ss.theme == "dark":
-        return dict(bg="#0b1220", card="#141d2e", card2="#1b2538", text="#e8eefb",
-                    sub="#93a4c0", border="#26344d", grid="rgba(255,255,255,.06)",
-                    accent="#7c3aed", accent2="#2563eb")
-    return dict(bg="#f5f7fb", card="#ffffff", card2="#f1f5f9", text="#0f172a",
-                sub="#5a6b86", border="#e2e8f0", grid="rgba(15,23,42,.06)",
-                accent="#7c3aed", accent2="#2563eb")
+        base = dict(bg="#0f1420", card="#171d2b", card2="#1e2636", text="#e6ebf4",
+                    sub="#9aa7bd", border="#2a3446", grid="rgba(255,255,255,.05)")
+    else:
+        base = dict(bg="#f6f8fa", card="#ffffff", card2="#f7f9fb", text="#1f2328",
+                    sub="#636c76", border="#e4e8ee", grid="rgba(31,35,40,.06)")
+    base.update(primary=prim, ok=ok, warn=warn, err=err, accent=prim, accent2=prim)
+    return base
 
 
 def inject_css():
     p = _palette()
     st.markdown(f"""<style>
-      @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
-      html, body, .stApp, [class*="css"] {{ font-family:'Inter',system-ui,sans-serif; }}
+      @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+      html, body, .stApp, [class*="css"] {{ font-family:'Inter',system-ui,-apple-system,sans-serif; }}
       .stApp {{ background:{p['bg']}; color:{p['text']}; }}
-      .block-container {{ padding-top:2.2rem; padding-bottom:3.5rem; max-width:1400px; }}
+      .block-container {{ padding-top:1.4rem; padding-bottom:3rem; max-width:1360px; }}
       section[data-testid="stSidebar"] {{ background:{p['card']}; border-right:1px solid {p['border']}; }}
-      section[data-testid="stSidebar"] .stRadio label {{ font-weight:500; }}
-      h1,h2,h3,h4 {{ color:{p['text']}; letter-spacing:-.01em; }}
-      ::-webkit-scrollbar {{ width:9px; height:9px; }}
+      h1,h2,h3,h4 {{ color:{p['text']}; letter-spacing:-.01em; font-weight:650; }}
+      h3 {{ font-size:1.05rem; margin:.4rem 0; }}  h4 {{ font-size:.92rem; }}
+      a {{ color:{p['primary']}; text-decoration:none; }}
+      ::-webkit-scrollbar {{ width:8px; height:8px; }}
       ::-webkit-scrollbar-thumb {{ background:{p['border']}; border-radius:8px; }}
 
-      /* KPI cards */
-      .kpi {{ position:relative; background:{p['card']}; border:1px solid {p['border']};
-              border-radius:16px; padding:18px 20px; overflow:hidden;
-              box-shadow:0 4px 18px rgba(2,8,23,.10); transition:transform .18s, box-shadow .18s;
-              animation:fade .4s ease both; }}
-      .kpi:hover {{ transform:translateY(-4px); box-shadow:0 10px 26px rgba(2,8,23,.18); }}
-      .kpi::before {{ content:""; position:absolute; left:0; top:0; bottom:0; width:5px;
-                      background:linear-gradient(180deg,var(--a1),var(--a2)); }}
+      /* top header bar */
+      .topbar {{ display:flex; align-items:center; justify-content:space-between; gap:14px;
+                 background:{p['card']}; border:1px solid {p['border']}; border-radius:10px;
+                 padding:10px 16px; margin-bottom:16px; }}
+      .topbar .brand {{ font-weight:700; font-size:1rem; color:{p['text']}; letter-spacing:-.02em; }}
+      .topbar .meta {{ display:flex; align-items:center; gap:8px; flex-wrap:wrap; }}
+      .chip {{ background:{p['card2']}; border:1px solid {p['border']}; border-radius:6px;
+               padding:3px 10px; font-size:.75rem; color:{p['sub']}; font-weight:500; }}
+      .dot {{ height:8px; width:8px; border-radius:50%; display:inline-block; margin-right:6px; vertical-align:middle; }}
+
+      /* page header */
+      .phead {{ border-bottom:1px solid {p['border']}; padding-bottom:12px; margin-bottom:18px; }}
+      .phead h1 {{ margin:0; font-size:1.35rem; font-weight:680; color:{p['text']}; }}
+      .phead p {{ margin:3px 0 0; color:{p['sub']}; font-size:.86rem; }}
+
+      /* KPI cards — flat, equal height, thin accent */
+      .kpi {{ background:{p['card']}; border:1px solid {p['border']}; border-radius:10px;
+              padding:14px 16px; box-shadow:0 1px 2px rgba(16,24,40,.04);
+              transition:box-shadow .15s, border-color .15s; height:100%; }}
+      .kpi:hover {{ box-shadow:0 4px 14px rgba(16,24,40,.08); border-color:{p['primary']}33; }}
       .kpi .top {{ display:flex; justify-content:space-between; align-items:center; }}
-      .kpi .label {{ color:{p['sub']}; font-size:.74rem; font-weight:600; text-transform:uppercase;
-                     letter-spacing:.06em; }}
-      .kpi .icon {{ font-size:1.25rem; opacity:.9; }}
-      .kpi .value {{ color:{p['text']}; font-size:1.9rem; font-weight:800; margin-top:6px; line-height:1.1; }}
-      .kpi .delta {{ font-size:.78rem; margin-top:3px; font-weight:600; }}
+      .kpi .label {{ color:{p['sub']}; font-size:.72rem; font-weight:600; text-transform:uppercase;
+                     letter-spacing:.04em; }}
+      .kpi .icon {{ font-size:.95rem; opacity:.55; }}
+      .kpi .value {{ color:{p['text']}; font-size:1.5rem; font-weight:700; margin-top:6px; line-height:1.15; }}
+      .kpi .delta {{ font-size:.75rem; margin-top:2px; font-weight:500; color:{p['sub']}; }}
+      .kpi .accent {{ height:3px; width:26px; border-radius:2px; margin-top:10px; background:var(--a1); }}
 
       /* badges */
-      .badge {{ display:inline-block; padding:7px 18px; border-radius:999px; font-weight:700; font-size:1rem; }}
-      .badge-theft {{ background:rgba(239,68,68,.14); color:#ef4444; border:1px solid rgba(239,68,68,.4); }}
-      .badge-normal {{ background:rgba(34,197,94,.14); color:#22c55e; border:1px solid rgba(34,197,94,.4); }}
-      .badge.pulse {{ animation:pulse 1.4s ease-in-out infinite; }}
+      .badge {{ display:inline-flex; align-items:center; gap:6px; padding:4px 12px; border-radius:6px;
+                font-weight:600; font-size:.85rem; }}
+      .badge-theft {{ background:rgba(220,38,38,.10); color:{p['err']}; border:1px solid rgba(220,38,38,.28); }}
+      .badge-normal {{ background:rgba(22,163,74,.10); color:{p['ok']}; border:1px solid rgba(22,163,74,.28); }}
 
-      /* hero / executive header */
-      .hero {{ position:relative; background:linear-gradient(120deg,#111c3a 0%,#3b1d7a 55%,#7c3aed 100%);
-               border-radius:20px; padding:28px 34px; color:#fff; margin-bottom:22px; overflow:hidden;
-               box-shadow:0 12px 34px rgba(76,29,149,.35); animation:fade .5s ease both; }}
-      .hero::after {{ content:""; position:absolute; right:-40px; top:-40px; width:220px; height:220px;
-                      background:radial-gradient(circle,rgba(255,255,255,.18),transparent 70%); }}
-      .hero h1 {{ margin:0; font-size:1.85rem; font-weight:800; color:#fff; }}
-      .hero p {{ margin:6px 0 0; opacity:.92; font-size:.98rem; }}
-
-      .pill {{ background:{p['card2']}; border:1px solid {p['border']}; border-radius:8px;
-               padding:4px 11px; font-size:.74rem; color:{p['sub']}; font-weight:500; }}
-      .sb-group {{ color:{p['sub']}; font-size:.7rem; font-weight:700; text-transform:uppercase;
-                   letter-spacing:.08em; margin:10px 2px 2px; }}
-      .mcard {{ background:{p['card2']}; border:1px solid {p['border']}; border-radius:14px;
-                padding:14px 16px; margin-top:8px; }}
-      .mcard .row {{ display:flex; justify-content:space-between; font-size:.8rem; padding:3px 0;
+      .pill {{ background:{p['card2']}; border:1px solid {p['border']}; border-radius:6px;
+               padding:3px 10px; font-size:.72rem; color:{p['sub']}; font-weight:500; }}
+      .sb-group {{ color:{p['sub']}; font-size:.68rem; font-weight:700; text-transform:uppercase;
+                   letter-spacing:.07em; margin:12px 2px 4px; }}
+      .mcard {{ background:{p['card2']}; border:1px solid {p['border']}; border-radius:8px;
+                padding:12px 14px; margin-top:8px; }}
+      .mcard .row {{ display:flex; justify-content:space-between; font-size:.78rem; padding:2px 0;
                      color:{p['sub']}; }} .mcard .row b {{ color:{p['text']}; font-weight:600; }}
-      .dot {{ height:9px; width:9px; border-radius:50%; display:inline-block; margin-right:6px; }}
 
-      /* callouts */
-      .callout {{ border-radius:12px; padding:13px 16px; margin:8px 0; font-weight:500;
-                  border:1px solid; animation:fade .3s ease both; }}
-      .c-ok {{ background:rgba(34,197,94,.10); border-color:rgba(34,197,94,.35); color:#22c55e; }}
-      .c-err {{ background:rgba(239,68,68,.10); border-color:rgba(239,68,68,.35); color:#ef4444; }}
-      .c-warn {{ background:rgba(245,158,11,.10); border-color:rgba(245,158,11,.35); color:#f59e0b; }}
-      .c-info {{ background:rgba(37,99,235,.10); border-color:rgba(37,99,235,.35); color:{p['accent2']}; }}
+      /* notification cards: icon + title + message */
+      .callout {{ display:flex; gap:10px; border-radius:8px; padding:11px 14px; margin:8px 0;
+                  border:1px solid; background:{p['card']}; }}
+      .callout .ci {{ font-size:1rem; line-height:1.4; }}
+      .callout .ct {{ font-weight:600; font-size:.86rem; margin-bottom:1px; }}
+      .callout .cm {{ font-size:.82rem; color:{p['sub']}; }}
+      .c-ok  {{ border-color:rgba(22,163,74,.30); }}   .c-ok  .ct {{ color:{p['ok']}; }}
+      .c-err {{ border-color:rgba(220,38,38,.30); }}   .c-err .ct {{ color:{p['err']}; }}
+      .c-warn{{ border-color:rgba(217,119,6,.30); }}   .c-warn .ct {{ color:{p['warn']}; }}
+      .c-info{{ border-color:rgba(37,99,235,.30); }}   .c-info .ct {{ color:{p['primary']}; }}
 
-      /* skeleton + footer + tables */
-      .skel {{ height:96px; border-radius:16px; background:linear-gradient(90deg,{p['card']} 25%,
-               {p['card2']} 37%,{p['card']} 63%); background-size:400% 100%;
-               animation:shimmer 1.3s infinite; }}
-      .footer {{ text-align:center; color:{p['sub']}; font-size:.78rem; margin-top:34px;
-                 padding-top:16px; border-top:1px solid {p['border']}; }}
-      [data-testid="stDataFrame"] {{ border:1px solid {p['border']}; border-radius:12px; }}
-      .stButton>button {{ border-radius:10px; font-weight:600; transition:all .15s; }}
-      .stButton>button:hover {{ transform:translateY(-1px); }}
-      .stTabs [data-baseweb="tab-list"] {{ gap:6px; }}
-      .stTabs [data-baseweb="tab"] {{ border-radius:10px 10px 0 0; font-weight:600; }}
+      /* empty state */
+      .empty {{ text-align:center; padding:40px 20px; color:{p['sub']}; border:1px dashed {p['border']};
+                border-radius:10px; background:{p['card']}; }}
+      .empty .ei {{ font-size:1.6rem; opacity:.5; }} .empty .et {{ font-weight:600; margin-top:6px; color:{p['text']}; }}
 
-      @keyframes fade {{ from {{ opacity:0; transform:translateY(8px); }} to {{ opacity:1; transform:none; }} }}
+      /* tables, buttons, tabs, footer */
+      .skel {{ height:88px; border-radius:10px; background:linear-gradient(90deg,{p['card']} 25%,
+               {p['card2']} 37%,{p['card']} 63%); background-size:400% 100%; animation:shimmer 1.3s infinite; }}
+      .footer {{ display:flex; justify-content:center; gap:14px; flex-wrap:wrap; color:{p['sub']};
+                 font-size:.76rem; margin-top:30px; padding-top:14px; border-top:1px solid {p['border']}; }}
+      [data-testid="stDataFrame"] {{ border:1px solid {p['border']}; border-radius:8px; }}
+      .stButton>button {{ border-radius:8px; font-weight:600; font-size:.86rem; border:1px solid {p['border']};
+                          transition:all .12s; }}
+      .stButton>button:hover {{ border-color:{p['primary']}; color:{p['primary']}; }}
+      .stButton>button[kind="primary"] {{ background:{p['primary']}; border-color:{p['primary']}; color:#fff; }}
+      .stButton>button[kind="primary"]:hover {{ filter:brightness(1.06); color:#fff; }}
+      .stTabs [data-baseweb="tab-list"] {{ gap:4px; border-bottom:1px solid {p['border']}; }}
+      .stTabs [data-baseweb="tab"] {{ font-weight:600; font-size:.86rem; }}
+
       @keyframes shimmer {{ 0% {{ background-position:100% 0; }} 100% {{ background-position:-100% 0; }} }}
-      @keyframes pulse {{ 0%,100% {{ box-shadow:0 0 0 0 currentColor; opacity:1; }}
-                          50% {{ box-shadow:0 0 0 6px transparent; opacity:.85; }} }}
     </style>""", unsafe_allow_html=True)
 
 
@@ -1140,37 +1154,71 @@ TMPL = "plotly_dark" if ss.theme == "dark" else "plotly_white"
 
 
 def style_fig(fig, height=320, title=None):
-    """Consistent Plotly styling across the whole app."""
+    """Consistent, restrained Plotly styling across the whole app."""
     p = _palette()
-    fig.update_layout(template=TMPL, height=height, title=title,
-                      margin=dict(t=40 if title else 14, b=10, l=10, r=10),
+    fig.update_layout(template=TMPL, height=height,
+                      title=dict(text=title, font=dict(size=13, family="Inter")) if title else None,
+                      margin=dict(t=38 if title else 12, b=10, l=10, r=10),
                       paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-                      font=dict(family="Inter", color=p["text"], size=12),
+                      font=dict(family="Inter", color=p["sub"], size=12),
+                      colorway=[p["primary"], p["ok"], p["warn"], p["err"], "#8b5cf6", "#0891b2"],
                       legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0))
     fig.update_xaxes(gridcolor=p["grid"], zeroline=False)
     fig.update_yaxes(gridcolor=p["grid"], zeroline=False)
     return fig
 
 
-def kpi(label, value, delta="", color="#3b82f6", icon="📊"):
-    a1, a2 = (color, color)
-    d = f'<div class="delta" style="color:{color}">{delta}</div>' if delta else ""
+def kpi(label, value, delta="", color="#2563eb", icon=""):
+    ic = f'<span class="icon">{icon}</span>' if icon else ""
+    d = f'<div class="delta">{delta}</div>' if delta else ""
     st.markdown(
-        f'<div class="kpi" style="--a1:{a1};--a2:{a2}">'
-        f'<div class="top"><span class="label">{label}</span><span class="icon">{icon}</span></div>'
-        f'<div class="value">{value}</div>{d}</div>', unsafe_allow_html=True)
+        f'<div class="kpi" style="--a1:{color}">'
+        f'<div class="top"><span class="label">{label}</span>{ic}</div>'
+        f'<div class="value">{value}</div>{d}<div class="accent"></div></div>',
+        unsafe_allow_html=True)
 
 
 def badge(status, pulse=False):
     cls = "badge-theft" if status == "Theft" else "badge-normal"
-    pc = " pulse" if pulse else ""
-    return f'<span class="badge {cls}{pc}">{"🔴" if status == "Theft" else "🟢"} {status}</span>'
+    dotc = "#dc2626" if status == "Theft" else "#16a34a"
+    return f'<span class="badge {cls}"><span class="dot" style="background:{dotc}"></span>{status}</span>'
 
 
-def callout(kind, msg):
-    cls = {"ok": "c-ok", "err": "c-err", "warn": "c-warn", "info": "c-info"}[kind]
-    ic = {"ok": "✅", "err": "🚫", "warn": "⚠️", "info": "ℹ️"}[kind]
-    st.markdown(f'<div class="callout {cls}">{ic}&nbsp; {msg}</div>', unsafe_allow_html=True)
+# Notification cards with icon + title + message (title inferred from kind).
+_CALLOUT = {"ok": ("✓", "Success", "c-ok"), "err": ("✕", "Error", "c-err"),
+            "warn": ("!", "Warning", "c-warn"), "info": ("i", "Note", "c-info")}
+
+
+def callout(kind, msg, title=None):
+    ic, deftitle, cls = _CALLOUT[kind]
+    st.markdown(
+        f'<div class="callout {cls}"><div class="ci">{ic}</div>'
+        f'<div><div class="ct">{title or deftitle}</div><div class="cm">{msg}</div></div></div>',
+        unsafe_allow_html=True)
+
+
+def empty_state(icon, title, msg):
+    st.markdown(f'<div class="empty"><div class="ei">{icon}</div>'
+                f'<div class="et">{title}</div><div>{msg}</div></div>', unsafe_allow_html=True)
+
+
+def top_header():
+    """Slim app-level header: brand · active model · dataset · status · theme."""
+    info = model_info()
+    online = info.get("loaded")
+    dotc = "#16a34a" if online else "#dc2626"
+    ds = get_setting("active_dataset_path")
+    ds_name = Path(ds).name if (ds and Path(ds).exists()) else "sample"
+    model_txt = info.get("name", "none") if online else "no model"
+    st.markdown(
+        f'<div class="topbar"><span class="brand">ETD·XAI Enterprise</span>'
+        f'<span class="meta">'
+        f'<span class="chip"><span class="dot" style="background:{dotc}"></span>'
+        f'{"Ready" if online else "No model"}</span>'
+        f'<span class="chip">Model: {model_txt}</span>'
+        f'<span class="chip">Dataset: {ds_name}</span>'
+        f'<span class="chip">{ss.theme.title()} theme</span>'
+        f'</span></div>', unsafe_allow_html=True)
 
 
 def risk_gauge(prob: float, threshold: float = 0.5):
@@ -1199,14 +1247,20 @@ def skeleton(cols=4):
 
 
 def footer():
+    tfv = model_info().get("tf_version", "—") if is_loaded() else "—"
     st.markdown(
-        f'<div class="footer">⚡ <b>ETD-XAI Enterprise</b> v{APP_VERSION} · '
-        f'Electricity Theft Detection using Explainable AI · CNN-LSTM (TensorFlow/Keras) · '
-        f'© {datetime.now().year} · MIT License</div>', unsafe_allow_html=True)
+        f'<div class="footer"><span>ETD-XAI Enterprise v{APP_VERSION}</span>'
+        f'<span>·</span><span>TensorFlow {tfv}</span>'
+        f'<span>·</span><a href="https://github.com/me30101152101959-tech/Theft" target="_blank">GitHub</a>'
+        f'<span>·</span><span>© {datetime.now().year} · MIT</span></div>', unsafe_allow_html=True)
 
 
 def hero(title, subtitle):
-    st.markdown(f'<div class="hero"><h1>{title}</h1><p>{subtitle}</p></div>', unsafe_allow_html=True)
+    # Clean page header (no gradient) — strip any leading emoji from page titles.
+    clean = title.strip()
+    if clean and clean[0] not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789":
+        clean = clean[1:].strip()
+    st.markdown(f'<div class="phead"><h1>{clean}</h1><p>{subtitle}</p></div>', unsafe_allow_html=True)
 
 
 def require_model() -> bool:
@@ -1732,5 +1786,6 @@ with st.sidebar:
     cc = counts()
     st.caption(f"🗃️ SQLite · {cc['predictions']} preds · {cc['manual']} manual")
 
+top_header()
 NAV[ss.nav_choice][1]()
 footer()
