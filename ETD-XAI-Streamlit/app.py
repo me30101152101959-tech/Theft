@@ -461,6 +461,21 @@ def config_threshold() -> float:
     return 0.5
 
 
+def startup_validation() -> list:
+    """Return the startup readiness checklist (logged + shown in the UI)."""
+    cfg = load_config()
+    checks = [
+        ("model loaded", is_loaded()),
+        ("scaler loaded", PIPELINE.using_saved_scaler),
+        ("config loaded", MODEL_CONFIG.exists()),
+        ("threshold loaded", is_loaded()),
+        ("prediction engine ready", is_loaded() and E.model is not None),
+    ]
+    for name, ok in checks:
+        print(f"{'✓' if ok else '✗'} {name}")
+    return checks
+
+
 def discover_models() -> list:
     """Dynamically discover every .keras/.h5 model in assets/ and uploads/."""
     seen, out = set(), []
@@ -513,7 +528,9 @@ def compatibility_report(uploaded_len: Optional[int] = None) -> dict:
         "✓ tf_version": tf().__version__,
         "✓ keras_version": getattr(_k, "__version__", "unknown"),
         "config_source": cfg.get("_source", str(MODEL_CONFIG.name)),
-        "config_vs_model": ("consistent" if not conflicts else conflicts),
+        "config_vs_model": ("consistent" if not conflicts else
+                            "Configuration differs from actual model. "
+                            "Using TensorFlow model information. (" + "; ".join(conflicts) + ")"),
         "✓ prediction_ready": is_loaded() and E.model is not None,
     }
     if uploaded_len is not None:
@@ -1783,8 +1800,14 @@ with st.sidebar:
                 st.rerun()
 
     st.divider()
+    st.markdown("<div class='sb-group'>System readiness</div>", unsafe_allow_html=True)
+    _rows = "".join(
+        f"<div class='row'><span>{'✓' if ok else '✗'} {name}</span>"
+        f"<b style='color:{'#16a34a' if ok else '#dc2626'}'>{'OK' if ok else '—'}</b></div>"
+        for name, ok in startup_validation())
+    st.markdown(f"<div class='mcard'>{_rows}</div>", unsafe_allow_html=True)
     cc = counts()
-    st.caption(f"🗃️ SQLite · {cc['predictions']} preds · {cc['manual']} manual")
+    st.caption(f"SQLite · {cc['predictions']} preds · {cc['manual']} manual")
 
 top_header()
 NAV[ss.nav_choice][1]()
