@@ -701,6 +701,149 @@ def run_batch(df, info, strategy="last_n", threshold=0.5) -> dict:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+# SECTION 4B — CSV/Excel dataset templates + smart validation (presentation-only;
+# does not touch model loading, preprocessing, scaling, or prediction)
+# ═════════════════════════════════════════════════════════════════════════════
+import datetime as _dt
+
+
+def _template_seq_len() -> int:
+    """Active sequence length — TensorFlow model is authoritative, else config,
+    else the original 120-day training default. Never hardcoded elsewhere."""
+    if is_loaded() and E.seq_len is not None:
+        return int(E.seq_len)
+    cfg = load_config()
+    return int(cfg.get("SEQ_LEN") or 120)
+
+
+def _template_dates(n: int) -> list:
+    """Sequential calendar-day column headers, driven by model_config.json's
+    START_DATE/DATE_FORMAT when present (Feature 11), else the training default
+    (01/01/2014, MM/DD/YYYY — matches the notebook's 120-day format)."""
+    cfg = load_config()
+    start_str = cfg.get("START_DATE", "01/01/2014")
+    fmt = cfg.get("DATE_FORMAT", "%m/%d/%Y")
+    try:
+        start = _dt.datetime.strptime(start_str, fmt)
+    except Exception:
+        start = _dt.datetime(2014, 1, 1); fmt = "%m/%d/%Y"
+    return [(start + _dt.timedelta(days=i)).strftime(fmt) for i in range(n)]
+
+
+def build_template_df(include_flag: bool, n_examples: int = 3) -> pd.DataFrame:
+    """Construct a template dataframe with realistic example readings.
+    Column order: date columns first, then CONS_NO, then FLAG (if requested) —
+    matching the exact training file layout. Deterministic (fixed seed)."""
+    n = _template_seq_len()
+    dates = _template_dates(n)
+    rng = np.random.default_rng(42)
+    rows = []
+    for i in range(n_examples):
+        base = 1800 + i * 300
+        vals = np.clip(base + rng.normal(0, 220, n), 0, None).round(0).astype(int)
+        if include_flag and i % 2 == 1:                      # alternate 0/1/0…
+            vals[n // 2:] = np.clip(rng.uniform(0, 40, n - n // 2), 0, None).round(0).astype(int)
+        row = {d: v for d, v in zip(dates, vals)}
+        row["CONS_NO"] = f"CUST_{i+1:06d}"
+        if include_flag:
+            row["FLAG"] = i % 2  # 0,1,0,...
+        rows.append(row)
+    cols = dates + ["CONS_NO"] + (["FLAG"] if include_flag else [])
+    return pd.DataFrame(rows, columns=cols)
+
+
+def render_dataset_templates(show_all: bool = True):
+    """'Dataset Templates' UI section — Production / Evaluation / Empty
+    downloads, dynamically generated from the active model's sequence length."""
+    n = _template_seq_len()
+    st.markdown("#### Dataset Templates")
+    st.caption(f"Templates are generated for the active configuration: **{n} daily readings**.")
+    if show_all:
+        c = st.columns(3)
+        with c[0]:
+            st.markdown("**Production**")
+            st.caption("Real customer readings, no ground truth. Use this for actual predictions.")
+            st.download_button("📥 Download Production Template", to_csv(build_template_df(False)),
+                               "production_template.csv", "text/csv", use_container_width=True)
+        with c[1]:
+            st.markdown("**Evaluation**")
+            st.caption("Includes FLAG ground truth, for measuring accuracy/precision/recall.")
+            st.download_button("📥 Download Evaluation Template", to_csv(build_template_df(True)),
+                               "evaluation_template.csv", "text/csv", use_container_width=True)
+        with c[2]:
+            st.markdown("**Empty**")
+            st.caption("Header row only — fill in your own customers and readings.")
+            empty_df = build_template_df(False, n_examples=0)
+            st.download_button("📥 Download Empty Template", to_csv(empty_df),
+                               "empty_template.csv", "text/csv", use_container_width=True)
+    else:
+        st.download_button("📥 Download CSV Template", to_csv(build_template_df(False)),
+                           "prediction_template.csv", "text/csv", use_container_width=True)
+        st.caption(f"{n} daily readings + customer ID — fill in your data and upload it above.")
+
+
+def validate_dataset_report(df: pd.DataFrame, info: dict) -> list:
+    """Smart validation checks (Feature 6/7) — read-only, does not alter df.
+    Returns a list of (kind, message) for display via callout()."""
+    checks = []
+    n = _template_seq_len()
+    expected_dates = set(_template_dates(n))
+    cols = [str(c) for c in df.columns]
+    date_like_cols = {c for c in cols if c in expected_dates}
+    missing = sorted(expected_dates - date_like_cols)
+    extra = [c for c in cols if c not in expected_dates
+             and str(c).strip().lower() not in ID_COLS | FLAG_COLS]
+
+    if info["n_readings"] == n and not missing:
+        checks.append(("ok", "Dataset format matches the active configuration."))
+    if missing:
+        checks.append(("warn", f"Missing expected reading column(s): {', '.join(missing[:5])}"
+                              + (f" … (+{len(missing)-5} more)" if len(missing) > 5 else "")))
+    if extra:
+        checks.append(("warn", f"Extra/unrecognised column(s) detected: {', '.join(map(str, extra[:5]))}"
+                              + (f" … (+{len(extra)-5} more)" if len(extra) > 5 else "")))
+    if info["id_col"]:
+        dup = df[info["id_col"]].duplicated().sum()
+        if dup:
+            checks.append(("err", f"Customer ID column contains {int(dup)} duplicate value(s)."))
+    else:
+        checks.append(("info", "No customer-ID column detected — one will be auto-generated."))
+    miss_vals = int(df[info["reading_cols"]].isna().sum().sum()) if info["reading_cols"] else 0
+    if miss_vals:
+        checks.append(("warn", f"{miss_vals:,} missing reading value(s) found — treated as 0."))
+    invalid = 0
+    for c in info["reading_cols"]:
+        invalid += int(pd.to_numeric(df[c], errors="coerce").isna().sum() - df[c].isna().sum())
+    if invalid:
+        checks.append(("err", f"{invalid:,} non-numeric reading value(s) found."))
+    if info["flag_col"]:
+        bad_flag = (~pd.to_numeric(df[info["flag_col"]], errors="coerce").isin([0, 1])).sum()
+        if bad_flag:
+            checks.append(("err", f"FLAG column contains {int(bad_flag)} value(s) that are not 0/1."))
+    if not checks:
+        checks.append(("ok", "Dataset format matches training data."))
+    return checks
+
+
+def render_dataset_preview(df: pd.DataFrame, info: dict):
+    """Feature 9 — dataset preview card (customers, readings, dates, flags, quality)."""
+    n = _template_seq_len()
+    dataset_type = "Training/Evaluation Dataset" if info["has_flag"] else "Production Dataset"
+    date_cols = [c for c in info["reading_cols"] if str(c) in set(_template_dates(n))]
+    start_d = date_cols[0] if date_cols else (info["reading_cols"][0] if info["reading_cols"] else "—")
+    end_d = date_cols[-1] if date_cols else (info["reading_cols"][-1] if info["reading_cols"] else "—")
+    c = st.columns(4)
+    with c[0]: kpi("Customers", f"{info['n_rows']:,}", icon="")
+    with c[1]: kpi("Readings", info["n_readings"], icon="")
+    with c[2]: kpi("Dataset Type", dataset_type.split()[0], dataset_type, icon="")
+    with c[3]: kpi("Missing values", f"{int(df.isna().sum().sum()):,}", icon="")
+    st.caption(f"Date range: **{start_d}** → **{end_d}** · "
+              f"Duplicate IDs: **{int(df[info['id_col']].duplicated().sum()) if info['id_col'] else 0}** · "
+              f"Ground truth (FLAG): **{'present' if info['has_flag'] else 'not present'}**")
+    st.dataframe(df.head(5), use_container_width=True)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 # SECTION 5 — Explainable AI (SHAP with integrated-gradients fallback)
 # ═════════════════════════════════════════════════════════════════════════════
 def shap_or_ig(readings: np.ndarray, background: Optional[np.ndarray] = None) -> Optional[dict]:
@@ -1449,6 +1592,10 @@ def page_batch():
     hero("📦 Batch Prediction", "Upload a dataset and score every customer.")
     if not require_model():
         return
+
+    with st.expander("📁 Dataset Templates", expanded=False):
+        render_dataset_templates(show_all=True)
+
     saved_ds = get_setting("active_dataset_path")
     has_saved = bool(saved_ds and Path(saved_ds).exists())
     options = ["Upload file"] + (["Use saved dataset"] if has_saved else []) + ["Use bundled sample"]
@@ -1467,9 +1614,10 @@ def page_batch():
     except Exception as e:
         st.error(f"Could not read file: {e}"); return
     info = inspect(df)
-    c = st.columns(4)
-    c[0].metric("Rows", f"{info['n_rows']:,}"); c[1].metric("Reading cols", info["n_readings"])
-    c[2].metric("ID column", info["id_col"] or "auto"); c[3].metric("FLAG", "yes ✅" if info["has_flag"] else "no")
+    render_dataset_preview(df, info)
+    st.markdown("##### Validation Report")
+    for kind, msg in validate_dataset_report(df, info):
+        callout(kind, msg)
     # v3.0 safety: never silently reshape. Fixed-length model + mismatch => require opt-in.
     T = E.seq_len
     mismatch = (T is not None and info["n_readings"] != T)
@@ -1492,7 +1640,6 @@ def page_batch():
         strat = strategy_selector("b_strat") if allow_resize else "last_n"
     thr = st.slider("Decision threshold", 0.0, 1.0, ss.threshold, 0.01, key="b_thr",
                     help=f"Config default for this model: {config_threshold():.2f}")
-    st.dataframe(df.head(8), use_container_width=True)
     c1, c2 = st.columns(2)
     run = c1.button("⚡ Run Predictions", type="primary", use_container_width=True,
                     disabled=(mismatch and not allow_resize))
@@ -1836,6 +1983,8 @@ def page_user_predict():
         callout("err", "The prediction service is temporarily unavailable. Please contact an administrator.",
                 "Service unavailable")
         return
+    with st.expander("📥 Need a template?", expanded=False):
+        render_dataset_templates(show_all=False)
     up = st.file_uploader("Upload consumption data (CSV or Excel)", type=["csv", "xlsx", "xls"])
     if not up:
         empty_state("⬆", "No file yet", "Choose a CSV or Excel file of customer readings to analyse.")
@@ -1846,8 +1995,9 @@ def page_user_predict():
         callout("err", "That file could not be read. Please upload a valid CSV or Excel file.", "Invalid file")
         return
     info = inspect(df)
-    st.caption(f"{info['n_rows']:,} customers · {info['n_readings']} readings per customer")
-    st.dataframe(df.head(6), use_container_width=True)
+    render_dataset_preview(df, info)
+    for kind, msg in validate_dataset_report(df, info):
+        callout(kind, msg)
     # Compatibility is enforced WITHOUT exposing model internals.
     T = E.seq_len
     if not (T is None or info["n_readings"] == T) or info["n_readings"] < 2:
