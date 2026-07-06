@@ -1220,22 +1220,22 @@ def empty_state(icon, title, msg):
 
 
 def top_header():
-    """Slim app-level header: brand · active model · dataset · status · theme."""
-    info = model_info()
-    online = info.get("loaded")
+    """Slim app-level header. Model/engine details are shown to admins only;
+    standard users see a neutral service-status header (no model leakage)."""
+    online = is_loaded()
     dotc = "#16a34a" if online else "#dc2626"
-    ds = get_setting("active_dataset_path")
-    ds_name = Path(ds).name if (ds and Path(ds).exists()) else "sample"
-    model_txt = info.get("name", "none") if online else "no model"
+    admin = ss.get("logged_in") and ss.get("role") == "Administrator"
+    meta = (f'<span class="chip"><span class="dot" style="background:{dotc}"></span>'
+            f'{"Ready" if online else "Unavailable"}</span>')
+    if admin:
+        info = model_info()
+        meta += f'<span class="chip">Model: {info.get("name","none") if online else "no model"}</span>'
+    if ss.get("role"):
+        meta += f'<span class="chip">{ss.get("username","")} · {ss.get("role")}</span>'
+    meta += f'<span class="chip">{ss.theme.title()} theme</span>'
     st.markdown(
         f'<div class="topbar"><span class="brand">ETD·XAI Enterprise</span>'
-        f'<span class="meta">'
-        f'<span class="chip"><span class="dot" style="background:{dotc}"></span>'
-        f'{"Ready" if online else "No model"}</span>'
-        f'<span class="chip">Model: {model_txt}</span>'
-        f'<span class="chip">Dataset: {ds_name}</span>'
-        f'<span class="chip">{ss.theme.title()} theme</span>'
-        f'</span></div>', unsafe_allow_html=True)
+        f'<span class="meta">{meta}</span></div>', unsafe_allow_html=True)
 
 
 def risk_gauge(prob: float, threshold: float = 0.5):
@@ -1746,19 +1746,190 @@ def page_settings():
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# SECTION 11 — Sidebar navigation + router
+# SECTION 11 — Authentication & Role-Based Access Control (RBAC)
 # ═════════════════════════════════════════════════════════════════════════════
-# Grouped navigation — page → (group, function)
-NAV = {
-    "📊 Dashboard": ("Overview", page_dashboard),
-    "🔮 Manual Prediction": ("Predict", page_manual),
-    "📦 Batch Prediction": ("Predict", page_batch),
-    "📜 History": ("Insights", page_history),
-    "📑 Reports": ("Insights", page_reports),
-    "🤖 AI Copilot": ("Insights", page_copilot),
-    "⚙️ Settings": ("System", page_settings),
+# Auth store — kept isolated so it can later be swapped for SQLite/Postgres
+# without touching application logic (same authenticate() contract).
+class AuthProvider:
+    """In-memory user store. Replace `verify()` with a DB lookup later."""
+    USERS = {
+        "admin": {"password": "admin", "role": "Administrator"},
+        "user":  {"password": "user",  "role": "Standard User"},
+    }
+
+    def verify(self, username: str, password: str) -> Optional[str]:
+        u = self.USERS.get((username or "").strip().lower())
+        if u and password == u["password"]:
+            return u["role"]
+        return None
+
+
+AUTH = AuthProvider()
+
+
+def is_admin() -> bool:
+    return ss.get("logged_in") and ss.get("role") == "Administrator"
+
+
+def require_admin():
+    """Defense-in-depth: every admin page calls this before rendering."""
+    if not is_admin():
+        callout("err", "You do not have permission to view this page.", "Access denied")
+        st.stop()
+
+
+def do_logout():
+    for k in ("logged_in", "username", "role", "nav_choice", "chat", "user_last"):
+        ss.pop(k, None)
+    st.rerun()
+
+
+def login_view():
+    """Professional login card shown before the app is accessible."""
+    _, mid, _ = st.columns([1, 1.1, 1])
+    with mid:
+        st.write("")
+        st.write("")
+        if LOGO.exists():
+            lc = st.columns([2, 1, 2])
+            lc[1].image(str(LOGO), width=64)
+        st.markdown(
+            "<div style='text-align:center;margin-bottom:6px'>"
+            "<div style='font-size:1.3rem;font-weight:700'>ETD-XAI Enterprise</div>"
+            "<div style='color:#636c76;font-size:.85rem'>Electricity Theft Detection Platform</div>"
+            "</div>", unsafe_allow_html=True)
+        with st.container(border=True):
+            st.markdown("**Sign in**")
+            u = st.text_input("Username", key="login_u", placeholder="admin or user")
+            p = st.text_input("Password", type="password", key="login_p")
+            remember = st.checkbox("Remember this session", value=True)
+            if st.button("Sign in", type="primary", use_container_width=True):
+                role = AUTH.verify(u, p)
+                if role:
+                    ss.logged_in = True
+                    ss.username = u.strip().lower()
+                    ss.role = role
+                    ss.remember = remember
+                    st.rerun()
+                else:
+                    callout("err", "Invalid username or password.", "Login failed")
+        st.caption("Demo credentials — admin / admin · user / user")
+
+
+# ── Role-specific pages (Standard User — no model/AI details exposed) ──────────
+def page_user_home():
+    hero("Home", f"Welcome, {ss.get('username','user')}. Detect electricity theft in a few clicks.")
+    c = st.columns(3)
+    with c[0]: kpi("Step 1", "Upload", "your consumption CSV/Excel", "#2563eb")
+    with c[1]: kpi("Step 2", "Predict", "run the analysis", "#16a34a")
+    with c[2]: kpi("Step 3", "Report", "download the results", "#d97706")
+    st.markdown("#### How it works")
+    st.markdown("- Go to **Predict**, upload a dataset of customer meter readings.\n"
+                "- The system analyses each customer and flags likely **theft** vs **normal**.\n"
+                "- Review the results table and **download a report** from the Reports page.")
+    empty_state("→", "Ready when you are", "Open <b>Predict</b> from the sidebar to begin.")
+
+
+def page_user_predict():
+    hero("Predict", "Upload a dataset and get theft-detection results.")
+    if not is_loaded():
+        callout("err", "The prediction service is temporarily unavailable. Please contact an administrator.",
+                "Service unavailable")
+        return
+    up = st.file_uploader("Upload consumption data (CSV or Excel)", type=["csv", "xlsx", "xls"])
+    if not up:
+        empty_state("⬆", "No file yet", "Choose a CSV or Excel file of customer readings to analyse.")
+        return
+    try:
+        df = read_table(up)
+    except Exception:
+        callout("err", "That file could not be read. Please upload a valid CSV or Excel file.", "Invalid file")
+        return
+    info = inspect(df)
+    st.caption(f"{info['n_rows']:,} customers · {info['n_readings']} readings per customer")
+    st.dataframe(df.head(6), use_container_width=True)
+    # Compatibility is enforced WITHOUT exposing model internals.
+    T = E.seq_len
+    if not (T is None or info["n_readings"] == T) or info["n_readings"] < 2:
+        callout("err", "This dataset is not compatible with the current system configuration. "
+                       "Please contact an administrator.", "Incompatible dataset")
+        return
+    if not st.button("Run prediction", type="primary", use_container_width=True):
+        return
+    with st.spinner("Analysing customers…"):
+        try:
+            result = run_batch(df, info, "last_n", config_threshold())  # threshold hidden from user
+        except Exception:
+            callout("err", "Prediction could not be completed. Please contact an administrator.", "Prediction error")
+            return
+    rdf = pd.DataFrame([{"Customer": r["customer_id"], "Prediction": r["status"],
+                         "Probability": f"{r['probability']*100:.1f}%",
+                         "Confidence": f"{r['confidence']*100:.1f}%",
+                         "Risk Score": f"{r['risk_score']:.0f}/100"} for r in result["rows"]])
+    ss.user_last = rdf
+    callout("ok", f"Analysed {result['total_rows']:,} customers — "
+                  f"{result['theft_rows']:,} flagged as theft, {result['normal_rows']:,} normal.", "Done")
+    m = st.columns(3)
+    with m[0]: kpi("Customers", f"{result['total_rows']:,}", icon="")
+    with m[1]: kpi("Theft flagged", f"{result['theft_rows']:,}", "", "#dc2626")
+    with m[2]: kpi("Normal", f"{result['normal_rows']:,}", "", "#16a34a")
+    st.dataframe(rdf, use_container_width=True, hide_index=True, height=380)
+    e = st.columns(2)
+    e[0].download_button("Download CSV", to_csv(rdf), "prediction_results.csv", "text/csv",
+                         use_container_width=True)
+    e[1].download_button("Download Excel", to_excel(rdf), "prediction_results.xlsx",
+                         use_container_width=True)
+
+
+def page_user_reports():
+    hero("Reports", "Download the results of your latest prediction.")
+    rdf = ss.get("user_last")
+    if rdf is None or len(rdf) == 0:
+        empty_state("▤", "No results yet", "Run a prediction first from the <b>Predict</b> page.")
+        return
+    st.dataframe(rdf, use_container_width=True, hide_index=True, height=420)
+    e = st.columns(2)
+    e[0].download_button("Download CSV", to_csv(rdf), "prediction_results.csv", "text/csv",
+                         use_container_width=True)
+    e[1].download_button("Download Excel", to_excel(rdf), "prediction_results.xlsx",
+                         use_container_width=True)
+
+
+# ── Role-based navigation maps (admin pages wrapped with a permission guard) ──
+def _admin(fn):
+    def _wrapped():
+        require_admin()
+        return fn()
+    return _wrapped
+
+
+NAV_ADMIN = {
+    "📊 Dashboard": ("Overview", _admin(page_dashboard)),
+    "🔮 Manual Prediction": ("Predict", _admin(page_manual)),
+    "📦 Batch Prediction": ("Predict", _admin(page_batch)),
+    "📜 History": ("Insights", _admin(page_history)),
+    "📑 Reports": ("Insights", _admin(page_reports)),
+    "🤖 AI Copilot": ("Insights", _admin(page_copilot)),
+    "⚙️ Settings": ("System", _admin(page_settings)),
 }
-GROUP_ORDER = ["Overview", "Predict", "Insights", "System"]
+NAV_USER = {
+    "🏠 Home": ("Home", page_user_home),
+    "⚡ Predict": ("Predict", page_user_predict),
+    "📄 Reports": ("Reports", page_user_reports),
+}
+GROUP_ORDER = ["Overview", "Home", "Predict", "Insights", "Reports", "System"]
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# SECTION 12 — Login gate + role-aware sidebar & router
+# ═════════════════════════════════════════════════════════════════════════════
+if not ss.get("logged_in"):
+    login_view()
+    st.stop()
+
+NAV = NAV_ADMIN if is_admin() else NAV_USER
+if ss.get("nav_choice") not in NAV:          # reset stale/tampered selection per role
+    ss.nav_choice = list(NAV.keys())[0]
 
 with st.sidebar:
     cols = st.columns([1, 3])
@@ -1767,32 +1938,34 @@ with st.sidebar:
     cols[1].markdown(f"### ⚡ ETD-XAI\n<span class='pill'>Enterprise v{APP_VERSION}</span>",
                      unsafe_allow_html=True)
 
-    info = model_info()
-    online = info.get("loaded")
-    dot = "#22c55e" if online else "#ef4444"
+    # Signed-in identity + role badge
+    role = ss.get("role", "")
+    rc = "#2563eb" if is_admin() else "#16a34a"
     st.markdown(
-        f"<div class='mcard'>"
-        f"<div class='row'><span><span class='dot' style='background:{dot}'></span>"
-        f"Model</span><b>{'Loaded' if online else 'Not loaded'}</b></div>"
-        + (f"<div class='row'><span>Name</span><b>{info['name']}</b></div>"
-           f"<div class='row'><span>Architecture</span><b>{info['architecture']}</b></div>"
-           f"<div class='row'><span>Input</span><b>{info['input_shape']}</b></div>"
-           f"<div class='row'><span>Params</span><b>{info['total_params_fmt']}</b></div>"
-           f"<div class='row'><span>TensorFlow</span><b>v{info['tf_version']}</b></div>"
-           f"<div class='row'><span>Compute</span><b>{'GPU' if has_gpu() else 'CPU'}</b></div>"
-           if online else f"<div class='row'><span>{NO_MODEL_MSG}</span><b></b></div>")
-        + "</div>", unsafe_allow_html=True)
+        f"<div class='mcard'><div class='row'><span>Signed in</span>"
+        f"<b>{ss.get('username','')}</b></div>"
+        f"<div class='row'><span>Role</span>"
+        f"<b style='color:{rc}'>{role}</b></div></div>", unsafe_allow_html=True)
 
-    # Grouped radio: build a flat list with group separators rendered above.
-    page_keys = list(NAV.keys())
-    if "nav_choice" not in ss:
-        ss.nav_choice = page_keys[0]
+    # Admin-only model status card (never shown to standard users)
+    if is_admin():
+        info = model_info()
+        online = info.get("loaded")
+        dot = "#16a34a" if online else "#dc2626"
+        st.markdown(
+            f"<div class='mcard'>"
+            f"<div class='row'><span><span class='dot' style='background:{dot}'></span>"
+            f"Model</span><b>{'Loaded' if online else 'Not loaded'}</b></div>"
+            + (f"<div class='row'><span>Name</span><b>{info['name']}</b></div>"
+               f"<div class='row'><span>Input</span><b>{info['input_shape']}</b></div>"
+               f"<div class='row'><span>Params</span><b>{info['total_params_fmt']}</b></div>"
+               f"<div class='row'><span>TensorFlow</span><b>v{info['tf_version']}</b></div>"
+               if online else f"<div class='row'><span>{NO_MODEL_MSG}</span><b></b></div>")
+            + "</div>", unsafe_allow_html=True)
+
     st.markdown("<div class='sb-group'>Navigation</div>", unsafe_allow_html=True)
     for grp in GROUP_ORDER:
-        items = [k for k, (g, _) in NAV.items() if g == grp]
-        if not items:
-            continue
-        st.markdown(f"<div class='sb-group'>{grp}</div>", unsafe_allow_html=True)
+        items = [k for k, (gp, _) in NAV.items() if gp == grp]
         for k in items:
             if st.button(k, use_container_width=True, key=f"nav_{k}",
                          type="primary" if ss.nav_choice == k else "secondary"):
@@ -1800,14 +1973,15 @@ with st.sidebar:
                 st.rerun()
 
     st.divider()
-    st.markdown("<div class='sb-group'>System readiness</div>", unsafe_allow_html=True)
-    _rows = "".join(
-        f"<div class='row'><span>{'✓' if ok else '✗'} {name}</span>"
-        f"<b style='color:{'#16a34a' if ok else '#dc2626'}'>{'OK' if ok else '—'}</b></div>"
-        for name, ok in startup_validation())
-    st.markdown(f"<div class='mcard'>{_rows}</div>", unsafe_allow_html=True)
-    cc = counts()
-    st.caption(f"SQLite · {cc['predictions']} preds · {cc['manual']} manual")
+    if is_admin():
+        st.markdown("<div class='sb-group'>System readiness</div>", unsafe_allow_html=True)
+        _rows = "".join(
+            f"<div class='row'><span>{'✓' if ok else '✗'} {name}</span>"
+            f"<b style='color:{'#16a34a' if ok else '#dc2626'}'>{'OK' if ok else '—'}</b></div>"
+            for name, ok in startup_validation())
+        st.markdown(f"<div class='mcard'>{_rows}</div>", unsafe_allow_html=True)
+    if st.button("Log out", use_container_width=True, key="logout_btn"):
+        do_logout()
 
 top_header()
 NAV[ss.nav_choice][1]()
