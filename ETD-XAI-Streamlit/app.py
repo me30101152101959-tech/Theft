@@ -1747,6 +1747,16 @@ def page_batch():
     # strategy (OFF by default). Variable-length model => data always as-is.
     T = E.seq_len
     mismatch = (T is not None and info["n_readings"] != T)
+
+    # Data distribution warning: model trained on specific length → poor accuracy on very different lengths
+    if mismatch and T is not None:
+        if info["n_readings"] > T * 1.5:
+            st.warning(f"⚠️ **Data mismatch detected**: Dataset has {info['n_readings']} readings, "
+                       f"but model trained on {T} readings. Predictions may have lower accuracy. "
+                       f"For best results, use data matching training conditions.", icon="⚠️")
+        elif info["n_readings"] < T * 0.5:
+            st.warning(f"⚠️ **Insufficient data**: Dataset has {info['n_readings']} readings, "
+                       f"model expects ~{T}. Predictions may be unreliable.", icon="⚠️")
     if T is None:
         integrity_note = "✓ Variable-length model — original data used, no modification."
         callout("ok", f"Model accepts <b>variable-length</b> input — the uploaded "
@@ -1770,8 +1780,13 @@ def page_batch():
         else:
             strat = "last_n"
             integrity_note = "✗ Incompatible dataset — prediction aborted (no resize applied)."
-    thr = st.slider("Decision threshold", 0.0, 1.0, ss.threshold, 0.01, key="b_thr",
-                    help=f"Config default for this model: {config_threshold():.2f}")
+    # Suggest adjusted threshold for data distribution mismatch
+    thr_default = ss.threshold
+    thr_help = f"Config default for this model: {config_threshold():.2f}"
+    if mismatch and T is not None and info["n_readings"] > T * 1.5:
+        thr_default = 0.10
+        thr_help += f" · **For {info['n_readings']}-day data (vs {T} training): try 0.10-0.20 for better accuracy**"
+    thr = st.slider("Decision threshold", 0.0, 1.0, thr_default, 0.01, key="b_thr", help=thr_help)
     callout("info" if "✓" in integrity_note else "err", integrity_note, "Data integrity")
     c1, c2 = st.columns(2)
     run = c1.button("⚡ Run Predictions", type="primary", use_container_width=True,
