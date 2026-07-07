@@ -687,7 +687,7 @@ def predict_one(readings, strategy="last_n", threshold=0.5) -> dict:
 # ═════════════════════════════════════════════════════════════════════════════
 # SECTION 4 — Dataset ingestion + evaluation metrics
 # ═════════════════════════════════════════════════════════════════════════════
-ID_COLS = {"cons_no", "customer_id", "id", "customer", "consumer_no", "meter_id", "user_id"}
+ID_COLS = {"cons_no", "customer_id", "consumer_id", "id", "customer", "consumer_no", "meter_id", "user_id"}
 FLAG_COLS = {"flag", "label", "target", "theft", "is_theft", "class", "y"}
 
 
