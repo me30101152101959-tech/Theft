@@ -1698,8 +1698,10 @@ def page_manual():
     with left:
         cid = st.text_input("Customer ID", value=f"CUST_{datetime.now().strftime('%H%M%S')}")
         n = st.number_input("Number of readings", 2, 2000, int(T or 26), 1,
-                            help=f"Model expects {T or 'variable'} readings; any length is auto-mapped.")
-        strat = strategy_selector("m_strat")
+                            help=(f"Model expects exactly {T} readings — input is never resized."
+                                  if T is not None else "Model accepts variable length."))
+        # Fixed-length model → no length-mapping strategy is ever applied.
+        strat = "last_n" if T is not None else strategy_selector("m_strat")
         thr = st.slider("Decision threshold", 0.0, 1.0, ss.threshold, 0.01)
         d1, d2 = st.columns(2)
         if d1.button("🟢 Demo: Normal", use_container_width=True):
@@ -1716,6 +1718,16 @@ def page_manual():
         if not raw or len(raw) < 2:
             with right:
                 callout("warn", "Enter at least 2 numeric readings.")
+            return
+        # STRICT fixed-length guard (validation layer only). The (None, T, 1) model
+        # was trained on exactly T chronological readings; user input is NEVER
+        # resized/padded/truncated/shifted. Only variable-length models (T is None)
+        # accept any length. The prediction engine below is untouched.
+        if T is not None and len(raw) != T:
+            with right:
+                extra = "<br>No automatic resizing is allowed." if len(raw) > T else ""
+                callout("err", f"<b>Invalid input.</b><br>Model expects exactly <b>{T}</b> "
+                               f"readings.<br>Received <b>{len(raw)}</b> readings.{extra}")
             return
         with right:
             with st.spinner("⚡ Running model.predict()…"):
@@ -1848,18 +1860,13 @@ def page_batch():
                       f"exactly — data sent as-is, no resizing.")
         allow_resize, strat = True, "last_n"
     else:
-        callout("err", f"<b>Incompatible dataset.</b><br>Uploaded sequence length: "
-                       f"<b>{info['n_readings']}</b><br>Model expects: <b>{T}</b><br>"
-                       f"Prediction aborted.")
-        allow_resize = st.checkbox("Enable Compatibility Resize (OFF by default)",
-                                   value=False, key="b_allow")
-        if allow_resize:
-            callout("warn", "This changes the original data and may affect prediction accuracy.")
-            strat = strategy_selector("b_strat")
-            integrity_note = f"✓ Resized by user request — strategy: {STRATEGY_LABELS[strat]}."
-        else:
-            strat = "last_n"
-            integrity_note = "✗ Incompatible dataset — prediction aborted (no resize applied)."
+        # STRICT: fixed-length model + length mismatch => hard abort. User data is
+        # NEVER resized/padded/truncated/interpolated (validation layer only).
+        callout("err", f"<b>Incompatible dataset.</b><br><br>Model expects: <b>{T}</b> readings"
+                       f"<br>Uploaded: <b>{info['n_readings']}</b> readings<br><br>"
+                       f"Prediction aborted. No automatic resizing is allowed.")
+        allow_resize, strat = False, "last_n"
+        integrity_note = "✗ Incompatible dataset — prediction aborted (no resize)."
     # Suggest adjusted threshold for data distribution mismatch
     thr_default = ss.threshold
     thr_help = f"Config default for this model: {config_threshold():.2f}"
@@ -1875,7 +1882,8 @@ def page_batch():
     if not run:
         return
     if mismatch and not allow_resize:
-        callout("err", "Blocked: length mismatch and no resize strategy selected.")
+        callout("err", f"Blocked: model expects exactly {T} readings, dataset has "
+                       f"{info['n_readings']}. No automatic resizing is allowed.")
         return
     if info["n_readings"] < 2:
         st.error("No usable reading columns (need ≥ 2 numeric)."); return
