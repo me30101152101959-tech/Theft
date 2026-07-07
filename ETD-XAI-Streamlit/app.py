@@ -349,10 +349,29 @@ def _rank(shape) -> int:
 
 
 def load_model(path: str, name: Optional[str] = None) -> dict:
+    path = str(path)
     name = name or Path(path).name
-    if Path(name).suffix.lower() not in (".keras", ".h5"):
+    if Path(path).suffix.lower() not in (".keras", ".h5"):
         raise ValueError("Unsupported format. Use .keras or .h5")
-    model = tf().keras.models.load_model(path)
+
+    # Apply Keras 3 compatibility shim for quantization_config
+    _t = tf()
+    try:
+        import keras
+        _orig = keras.layers.Dense.from_config.__func__
+        @classmethod
+        def _compat(cls, config):
+            config = dict(config)
+            config.pop("quantization_config", None)
+            dt = config.get("dtype")
+            if isinstance(dt, dict):
+                config["dtype"] = dt.get("config", {}).get("name", "float32")
+            return _orig(cls, config)
+        keras.layers.Dense.from_config = _compat
+    except Exception:
+        pass
+
+    model = _t.keras.models.load_model(path)
 
     classes = {l.__class__.__name__.lower() for l in model.layers}
     if not (any("conv" in c for c in classes) or any(k in c for c in classes for k in ("lstm", "gru", "rnn"))):
