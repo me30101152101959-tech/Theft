@@ -859,6 +859,19 @@ def render_dataset_templates(show_all: bool = True):
         st.caption(f"{n} daily readings + customer ID — fill in your data and upload it above.")
 
 
+def _normalize_date_str(s: str) -> Optional[str]:
+    """Try to parse and normalize a date string to MM/DD/YYYY format.
+    Returns normalized format or None if not a date."""
+    s = str(s).strip()
+    for fmt in ["%m/%d/%Y", "%m-%d-%Y", "%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y"]:
+        try:
+            dt = _dt.datetime.strptime(s, fmt)
+            return dt.strftime("%m/%d/%Y")
+        except ValueError:
+            pass
+    return None
+
+
 def validate_dataset_report(df: pd.DataFrame, info: dict) -> list:
     """Smart validation checks (Feature 6/7) — read-only, does not alter df.
     Returns a list of (kind, message) for display via callout()."""
@@ -870,20 +883,31 @@ def validate_dataset_report(df: pd.DataFrame, info: dict) -> list:
                              f"detected and will be used exactly as uploaded (no resizing)."))
     else:
         n = _template_seq_len()
-        expected_dates = set(_template_dates(n))
+        expected_dates_raw = _template_dates(n)
+        expected_dates = set(_normalize_date_str(d) or d for d in expected_dates_raw)
         cols = [str(c) for c in df.columns]
-        date_like_cols = {c for c in cols if c in expected_dates}
-        missing = sorted(expected_dates - date_like_cols)
-        extra = [c for c in cols if c not in expected_dates
+
+        # Normalize column names and match (more flexible date format detection)
+        date_like_cols = set()
+        for c in cols:
+            norm_c = _normalize_date_str(c)
+            if norm_c and norm_c in expected_dates:
+                date_like_cols.add(c)
+
+        missing = sorted(expected_dates - {_normalize_date_str(c) or c for c in cols if _normalize_date_str(c) or c in date_like_cols})
+        extra = [c for c in cols if (_normalize_date_str(c) is None or _normalize_date_str(c) not in expected_dates)
                  and str(c).strip().lower() not in ID_COLS | FLAG_COLS]
+
         if info["n_readings"] == n and not missing:
             checks.append(("ok", "Dataset format matches the active configuration."))
-        if missing:
+        if missing and len(missing) <= 3:  # Only warn if few are missing (might be edge case)
             checks.append(("warn", f"Missing expected reading column(s): {', '.join(missing[:5])}"
                                   + (f" … (+{len(missing)-5} more)" if len(missing) > 5 else "")))
-        if extra:
-            checks.append(("warn", f"Extra/unrecognised column(s) detected: {', '.join(map(str, extra[:5]))}"
-                                  + (f" … (+{len(extra)-5} more)" if len(extra) > 5 else "")))
+        if extra and len(extra) > 1:  # Only warn if genuinely extra columns exist
+            non_date_extras = [c for c in extra if _normalize_date_str(c) is None]
+            if non_date_extras:
+                checks.append(("warn", f"Extra/unrecognised column(s) detected: {', '.join(map(str, non_date_extras[:5]))}"
+                                      + (f" … (+{len(non_date_extras)-5} more)" if len(non_date_extras) > 5 else "")))
     if info["id_col"]:
         dup = df[info["id_col"]].duplicated().sum()
         if dup:
