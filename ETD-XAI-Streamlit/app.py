@@ -715,16 +715,34 @@ def read_table(file) -> pd.DataFrame:
     return pd.read_excel(file) if name.endswith((".xlsx", ".xls")) else pd.read_csv(file)
 
 
-def inspect(df: pd.DataFrame) -> dict:
+def detect_reading_columns(df) -> Tuple[list, object, object]:
+    """SINGLE source of truth for reading-column detection (Rules 2/4).
+    Returns (reading_cols, id_col, flag_col).
+    - excludes ID / metadata columns (CONS_NO, consumer_id, CustomerID, ID, …)
+    - excludes FLAG / label columns (never enters the model)
+    - keeps only numeric columns (≥50% parseable)
+    - PRESERVES the file's column order.
+    Manual and Batch both resolve reading columns through this one function.
+
+    Note on Rule 3 (chronological reorder): intentionally NOT applied. Day-first
+    (DD/MM/YYYY) vs month-first (MM/DD/YYYY) headers are ambiguous to parse, so
+    auto-sorting can silently scramble a correctly-ordered sequence (verified on
+    sample_dataset.csv, which is DD/MM). Trusting the author's CSV order is the
+    integrity-preserving choice — the sequence is fed exactly as delivered."""
     cols = list(df.columns)
     lower = {c: str(c).strip().lower() for c in cols}
     id_col = next((c for c in cols if lower[c] in ID_COLS), None)
     flag_col = next((c for c in cols if lower[c] in FLAG_COLS), None)
     reading_cols = [c for c in cols if c not in (id_col, flag_col)
                     and pd.to_numeric(df[c], errors="coerce").notna().mean() >= 0.5]
+    return reading_cols, id_col, flag_col
+
+
+def inspect(df: pd.DataFrame) -> dict:
+    reading_cols, id_col, flag_col = detect_reading_columns(df)
     return {"id_col": id_col, "flag_col": flag_col, "reading_cols": reading_cols,
             "n_readings": len(reading_cols), "n_rows": len(df),
-            "has_flag": flag_col is not None, "columns": [str(c) for c in cols]}
+            "has_flag": flag_col is not None, "columns": [str(c) for c in df.columns]}
 
 
 def build_matrix(df, info) -> Tuple[np.ndarray, list, Optional[np.ndarray]]:
@@ -735,6 +753,14 @@ def build_matrix(df, info) -> Tuple[np.ndarray, list, Optional[np.ndarray]]:
     if info["flag_col"]:  # ground truth — used ONLY for metrics below
         flags = pd.to_numeric(df[info["flag_col"]], errors="coerce").fillna(0).astype(int).to_numpy()
     return readings, ids, flags
+
+
+def _input_hash(readings_2d) -> str:
+    """Deterministic md5 of the reading matrix that feeds the pipeline (Rule 9).
+    Identical readings ⇒ identical hash across Manual, Batch, and any caller."""
+    import hashlib
+    arr = np.ascontiguousarray(np.asarray(readings_2d, dtype=np.float32))
+    return hashlib.md5(arr.tobytes()).hexdigest()
 
 
 def compute_metrics(flags, preds, probs) -> dict:
@@ -1708,6 +1734,8 @@ def page_manual():
                     {"High": "#ef4444", "Medium": "#f59e0b", "Low": "#22c55e"}[res["risk_level"]], "🎯")
             st.caption(f"🕒 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} · model **{res['model_name']}** · "
                        f"{res['uploaded_len']}→{res['model_len']} · strategy `{res['strategy_used']}`")
+            st.caption(f"🔒 Input hash (md5): `{_input_hash(np.asarray(raw).reshape(1, -1))}` — "
+                       f"identical to the Batch hash for the same readings.")
             fig = go.Figure(go.Scatter(y=raw, mode="lines+markers", line=dict(color="#7c3aed", width=2),
                                        fill="tozeroy", fillcolor="rgba(124,58,237,.12)"))
             st.plotly_chart(style_fig(fig, height=240, title="Consumption Sequence (kWh)"),
@@ -1768,6 +1796,31 @@ def page_batch():
         st.json(rep)
         st.progress(rep["✓ overall_compatibility_pct"] / 100,
                    text=f"Overall Compatibility: {rep['✓ overall_compatibility_pct']}%")
+
+    # Developer Mode — input-tensor verification (Rules 9/10). Read-only; the
+    # reading hash lets you confirm Manual and Batch feed model.predict() the
+    # exact same bytes for the same customer.
+    if st.checkbox("🛠 Developer Mode (input verification)", value=False, key="b_dev"):
+        _rd, _ids, _fl = build_matrix(df, info)
+        _rhash = _input_hash(_rd)
+        _ignored = [c for c in map(str, df.columns)
+                    if c not in set(map(str, info["reading_cols"]))]
+        st.json({
+            "reading_count": info["n_readings"],
+            "detected_columns": [str(c) for c in info["reading_cols"][:6]]
+                                + (["…"] if info["n_readings"] > 6 else []),
+            "ignored_columns": _ignored,
+            "reading_hash_md5": _rhash,
+            "sequence_shape": f"({len(_rd)}, {info['n_readings']}, {E.seq_channels})",
+            "statistics_shape": f"({len(_rd)}, {E.stat_size})",
+            "scaler_loaded": PIPELINE.using_saved_scaler,
+            "scaler_locked": PIPELINE._locked,
+            "threshold": config_threshold(),
+            "model_input_shape": str(E.input_shape),
+            "model_name": E.name,
+            "prediction_mode": "Evaluation (FLAG present)" if info["has_flag"] else "Prediction only",
+        })
+        st.caption("Same customer readings ⇒ identical `reading_hash_md5` in Manual and Batch.")
 
     # Section 5/6/7 — never silently reshape. Fixed-length model + mismatch
     # => prediction is BLOCKED unless the user explicitly opts into ONE resize
