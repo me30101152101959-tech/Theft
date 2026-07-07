@@ -1755,6 +1755,14 @@ def page_batch():
     for kind, msg in validate_dataset_report(df, info):
         callout(kind, msg)
 
+    # Prediction Mode notice — FLAG is OPTIONAL (ground truth only, never required)
+    if info["has_flag"]:
+        callout("ok", "<b>Evaluation Mode</b> — Ground Truth (FLAG) detected. "
+                      "Predictions will run and evaluation metrics will be computed.")
+    else:
+        callout("info", "<b>Prediction Mode</b> — Ground Truth (FLAG) not detected. "
+                        "Predictions will be generated normally. Evaluation metrics are disabled.")
+
     with st.expander("🔧 Compatibility Panel", expanded=False):
         rep = compatibility_report(info["n_readings"])
         st.json(rep)
@@ -1835,17 +1843,25 @@ def page_batch():
     prog.progress(100, "Done"); prog.empty()
     st.success(f"Scored {result['total_rows']:,} customers — {result['theft_rows']:,} theft / "
                f"{result['normal_rows']:,} normal.", icon="✅")
-    rdf = pd.DataFrame([{k: r[k] for k in ("customer_id", "probability", "prediction",
-                        "confidence", "risk_score", "status")} for r in result["rows"]])
+    _out_keys = ("customer_id", "probability", "prediction", "confidence", "risk_score", "status")
+    if result["has_flag"]:
+        rdf = pd.DataFrame([{"customer_id": r["customer_id"], "flag": r["flag"],
+                             **{k: r[k] for k in _out_keys[1:]}} for r in result["rows"]])
+    else:
+        rdf = pd.DataFrame([{k: r[k] for k in _out_keys} for r in result["rows"]])
     m = st.columns(3)
     m[0].metric("Theft detected", f"{result['theft_rows']:,}")
     m[1].metric("Theft rate", f"{result['theft_rate'] * 100:.1f}%")
     m[2].metric("Avg risk", f"{result['avg_risk']:.0f}/100")
     if result["metrics"]:
         mm = result["metrics"]
+        st.markdown("##### 📊 Evaluation Metrics (vs Ground-Truth FLAG)")
         st.info(f"Accuracy {mm['accuracy']:.3f} · Precision {mm['precision_val']:.3f} · "
                 f"Recall {mm['recall_val']:.3f} · F1 {mm['f1_score']:.3f}"
                 + (f" · ROC-AUC {mm['roc_auc']:.3f}" if mm.get("roc_auc") else ""))
+    else:
+        st.success("✔ Prediction completed successfully. No Ground Truth (FLAG) was provided — "
+                   "evaluation metrics are unavailable.", icon="✅")
     flt = st.selectbox("Filter", ["All", "Theft only", "Normal only"])
     show = rdf if flt == "All" else rdf[rdf.status == flt.split()[0]]
     st.dataframe(show.sort_values("risk_score", ascending=False), use_container_width=True,
