@@ -90,7 +90,11 @@ def scale_sequences(readings: np.ndarray) -> np.ndarray:
 
 
 def _features_for_row(row: np.ndarray) -> list:
-    """59 statistical features — verbatim from training CELL 7."""
+    """59 statistical features — verbatim from training CELL 7 (final_project.py).
+    Corrected 2026 audit: the day/night+autocorrelation block previously assumed
+    48-samples-per-day (n>=48, lags 48/336). The actual training notebook treats
+    each reading as one full day (n>=7, week1=row[:7]/week2=row[7:14], lags 7/14).
+    Also restores the trailing zero-run (post-loop append) the old code dropped."""
     row = row.astype(np.float32)
     n = len(row)
     mean = np.mean(row); std = np.std(row); mx = np.max(row); mn = np.min(row)
@@ -101,13 +105,14 @@ def _features_for_row(row: np.ndarray) -> list:
     iqr = p75 - p25
     zero_ratio = np.mean(row == 0); neg_ratio = np.mean(row < 0)
     near_zero = np.mean(row < 0.01); low_cons_ratio = np.mean(row < mean * 0.1)
-    drop_ratio = np.mean(np.diff(row) < -std)
+    diffs_tmp = np.diff(row)
+    drop_ratio = np.mean(diffs_tmp < -std) if len(diffs_tmp) > 0 else 0.0
     t = np.arange(n)
     slope = np.polyfit(t, row, 1)[0]
     resid = row - np.polyval(np.polyfit(t, row, 1), t)
     resid_std = np.std(resid)
     energy = np.sum(row ** 2) / n
-    hist, _ = np.histogram(row, bins=30, density=True)
+    hist, _ = np.histogram(row, bins=min(30, n), density=True)
     ent = entropy(hist + 1e-9)
     runs, cnt = [], 0
     for v in row:
@@ -116,40 +121,39 @@ def _features_for_row(row: np.ndarray) -> list:
         else:
             if cnt > 0: runs.append(cnt)
             cnt = 0
+    if cnt > 0: runs.append(cnt)          # trailing zero-run (was missing)
     max_zero_run = max(runs) if runs else 0
     n_zero_runs = len(runs)
-    if n >= 48:
-        n_days = n // 48
-        days = row[:n_days * 48].reshape(n_days, 48)
-        dm = np.mean(days, axis=1); ds = np.std(days, axis=1)
-        day_cons = np.mean(days[:, :24]); night_cons = np.mean(days[:, 24:])
-        dn_ratio = day_cons / (night_cons + 1e-9)
-        day_cv = np.std(dm) / (np.mean(dm) + 1e-9)
-        theft_days = np.mean(dm < np.mean(dm) * 0.5)
-        day_chg = np.abs(np.diff(dm))
+    if n >= 7:
+        day_chg = np.abs(np.diff(row))
         max_day_chg = np.max(day_chg) if len(day_chg) > 0 else 0
         mean_day_chg = np.mean(day_chg) if len(day_chg) > 0 else 0
-        dm_mean, dm_std = np.mean(dm), np.std(dm)
-        dm_max, dm_min = np.max(dm), np.min(dm); ds_mean = np.mean(ds)
+        dm_mean = np.mean(row); dm_std = np.std(row)
+        dm_max = np.max(row); dm_min = np.min(row); ds_mean = np.std(row)
+        day_cv = dm_std / (dm_mean + 1e-9)
+        theft_days = np.mean(row < dm_mean * 0.5)
+        week1 = row[:7] if n >= 14 else row[:n // 2]
+        week2 = row[7:14] if n >= 14 else row[n // 2:]
+        dn_ratio = np.mean(week1) / (np.mean(week2) + 1e-9)
     else:
         dn_ratio = day_cv = theft_days = 0
         max_day_chg = mean_day_chg = 0
         dm_mean = dm_std = dm_max = dm_min = ds_mean = 0
-    ac1 = np.corrcoef(row[:-1], row[1:])[0, 1] if n > 1 else 0
-    ac48 = np.corrcoef(row[:-48], row[48:])[0, 1] if n > 48 else 0
-    ac7d = np.corrcoef(row[:-336], row[336:])[0, 1] if n > 336 else 0
+    ac1 = float(np.corrcoef(row[:-1], row[1:])[0, 1]) if n > 1 else 0.0
+    ac48 = float(np.corrcoef(row[:-7], row[7:])[0, 1]) if n > 7 else 0.0
+    ac7d = float(np.corrcoef(row[:-14], row[14:])[0, 1]) if n > 14 else 0.0
     fft_v = np.abs(np.fft.rfft(row))
     fft_mean = np.mean(fft_v); fft_std = np.std(fft_v); fft_max = np.max(fft_v)
     dominant_freq = np.argmax(fft_v[1:]) + 1
-    if n >= 100:
+    if n >= 14:
         mean_change = np.mean(row[n // 2:]) - np.mean(row[:n // 2])
         std_change = np.std(row[n // 2:]) - np.std(row[:n // 2])
     else:
         mean_change = std_change = 0.0
     diffs = np.diff(row)
-    max_drop = np.min(diffs) if len(diffs) > 0 else 0
-    max_rise = np.max(diffs) if len(diffs) > 0 else 0
-    n_big_drops = np.sum(diffs < -2 * std); n_big_rises = np.sum(diffs > 2 * std)
+    max_drop = float(np.min(diffs)) if len(diffs) > 0 else 0.0
+    max_rise = float(np.max(diffs)) if len(diffs) > 0 else 0.0
+    n_big_drops = int(np.sum(diffs < -2 * std)); n_big_rises = int(np.sum(diffs > 2 * std))
     below_median = np.mean(row < median); above_median = np.mean(row > median)
     quarters = np.array_split(row, 4)
     q_means = [np.mean(q) for q in quarters]; q_stds = [np.std(q) for q in quarters]
