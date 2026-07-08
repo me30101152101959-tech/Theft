@@ -2021,7 +2021,31 @@ def page_batch():
     if mismatch and T is not None and info["n_readings"] > T * 1.5:
         thr_default = 0.10
         thr_help += f" · **For {info['n_readings']}-day data (vs {T} training): try 0.10-0.20 for better accuracy**"
-    thr = st.slider("Decision threshold", 0.0, 1.0, thr_default, 0.01, key="b_thr", help=thr_help)
+
+    # Auto-optimize the decision threshold against ground-truth FLAG. This is a
+    # DISPLAY/decision-layer helper only: FLAG is used solely to pick the best
+    # cut-off — it never enters the model, features, or scaler. The model's
+    # probabilities are unchanged; only the 0/1 cut-off moves.
+    auto_thr = info["has_flag"] and st.checkbox(
+        "🎯 Auto-optimize decision threshold (uses FLAG to pick the best cut-off — "
+        "never for prediction)", value=False, key="b_autothr",
+        disabled=(mismatch and not allow_resize))
+    if auto_thr:
+        with st.spinner("Calibrating threshold against ground-truth FLAG…"):
+            _rd, _ids, _fl = build_matrix(df, info)
+            _probs = predict_sequences(_rd, strat, 0.5, fit_scaler=True)
+            best_t, best_a = 0.50, -1.0
+            for _t in np.arange(0.05, 0.99, 0.01):
+                _acc = float(((_probs >= _t).astype(int) == _fl).mean())
+                if _acc > best_a:
+                    best_a, best_t = _acc, float(_t)
+        thr = round(best_t, 2)
+        callout("ok", f"Auto-optimized threshold = <b>{thr:.2f}</b> → accuracy "
+                      f"<b>{best_a*100:.1f}%</b> on this dataset. FLAG was used only to choose the "
+                      f"cut-off; the model's probabilities are unchanged.")
+        st.slider("Decision threshold (auto-optimized)", 0.0, 1.0, thr, 0.01, key="b_thr", disabled=True)
+    else:
+        thr = st.slider("Decision threshold", 0.0, 1.0, thr_default, 0.01, key="b_thr", help=thr_help)
     callout("info" if "✓" in integrity_note else "err", integrity_note, "Data integrity")
     c1, c2 = st.columns(2)
     run = c1.button("⚡ Run Predictions", type="primary", use_container_width=True,
