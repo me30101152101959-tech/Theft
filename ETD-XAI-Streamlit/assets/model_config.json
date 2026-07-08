@@ -1,0 +1,18 @@
+{
+  "SEQ_LEN": 120,
+  "N_STAT": 59,
+  "base_model": {
+    "file": "base_cnnlstm_final.keras",
+    "best_thr": 0.4149999999999998,
+    "auc": 0.9691038580246913,
+    "accuracy": 0.9088888888888889,
+    "f1": 0.9086859688195991
+  },
+  "tl_model": {
+    "file": "tl_cnnlstm_final.keras",
+    "best_thr": 0.38999999999999985,
+    "auc": 0.9692799382716049,
+    "accuracy": 0.9108333333333334,
+    "f1": 0.9106596159198441
+  }
+}
