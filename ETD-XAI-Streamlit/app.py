@@ -1638,97 +1638,199 @@ def _dashboard_source():
     return None
 
 
+def _alarm_level(risk):
+    return ("Critical" if risk >= 90 else "High" if risk >= 75
+            else "Medium" if risk >= 40 else "Low")
+
+
 def page_dashboard():
-    """Charts-only dashboard (admin + user): theft/normal, daily usage line,
-    per-day usage column, with customer / month / day slicers. Day mapping is
-    POSITIONAL (column order = day 1..N) so it works with any column names —
-    the date headers do not need to be fixed."""
-    hero("📊 Dashboard", "Electricity usage & theft detection")
+    """Enterprise analytics dashboard (admin + user). READ-ONLY: it never mutates
+    the dataframe, reading columns, model, scaler, threshold or predictions. The
+    ONLY source of reading columns is info["reading_cols"] from inspect(); it never
+    re-detects columns. Predictions come from the existing run_batch() only."""
+    # ── Section 1 — header ──
+    hero("Electricity Theft Analytics", "Enterprise Monitoring Dashboard")
     src = _dashboard_source()
     if src is None:
-        callout("info", "No dataset available. Upload a file above to see the dashboard.")
+        callout("info", "No dataset available. Upload a file above to view the dashboard.")
         return
     try:
         df = read_table(src)
     except Exception as e:
         callout("err", f"Could not read file: {e}"); return
-    info = inspect(df)
+    info = inspect(df)                                    # single source of truth
     if info["n_readings"] < 2:
         callout("err", "No usable reading columns found (need ≥ 2 numeric)."); return
-    readings, ids, _flags = build_matrix(df, info)
+    readings, ids, _flags = build_matrix(df, info)        # readings uses info["reading_cols"]
     n_days = readings.shape[1]
+    day_cols = [str(c) for c in info["reading_cols"]]
 
-    # Predictions (theft/normal) only when the length matches the model.
-    status = None
-    if E.seq_len is None or n_days == E.seq_len:
-        try:
-            res = run_batch(df, info, "last_n", config_threshold())
-            status = {r["customer_id"]: r["status"] for r in res["rows"]}
-        except Exception:
-            status = None
+    # Predictions via the existing engine only (read-only; run_batch adapts length).
+    probs = np.full(len(ids), np.nan)
+    have_pred = False
+    try:
+        res = run_batch(df, info, "last_n", config_threshold())
+        probs = np.array([r["probability"] for r in res["rows"]], dtype=float)
+        have_pred = True
+    except Exception:
+        have_pred = False
+    risk = np.round(probs * 100, 1)
+    thr = config_threshold()
+    pred = (probs >= thr).astype(int) if have_pred else np.zeros(len(ids), int)
+    alarms = np.array([_alarm_level(r) for r in risk]) if have_pred else np.array(["—"] * len(ids))
+    total_cons = readings.sum(axis=1)
 
-    # ── Slicers: customer / month / day (positional) ──
+    # ── Section 2 — filters ──
     n_months = (n_days + 29) // 30
-    f = st.columns(3)
-    cust_sel = f[0].selectbox("👤 Customer", ["All customers"] + ids, key="dash_cust")
-    month_sel = f[1].selectbox("📅 Month", ["All months"] + [f"Month {m}" for m in range(1, n_months + 1)],
-                               key="dash_month")
-    day_sel = f[2].selectbox("🗓️ Day", ["All days"] + [f"Day {d}" for d in range(1, n_days + 1)],
-                             key="dash_day")
+    f = st.columns(5)
+    cust_sel = f[0].selectbox("Customer", ["All"] + ids, key="dash_cust")
+    month_sel = f[1].selectbox("Month", ["All"] + [f"Month {m}" for m in range(1, n_months + 1)], key="dash_month")
+    day_sel = f[2].selectbox("Day", ["All"] + [f"Day {d}" for d in range(1, n_days + 1)], key="dash_day")
+    pred_sel = f[3].selectbox("Prediction", ["All", "Normal", "Theft"], key="dash_pred")
+    risk_sel = f[4].selectbox("Risk level", ["All", "Critical", "High", "Medium", "Low"], key="dash_risk")
 
-    cust_idx = np.arange(len(ids)) if cust_sel == "All customers" else np.array([ids.index(cust_sel)])
-    day_mask = np.ones(n_days, dtype=bool)
-    if month_sel != "All months":
-        m = int(month_sel.split()[-1]); day_mask[:] = False
-        day_mask[(m - 1) * 30: min(m * 30, n_days)] = True
-    if day_sel != "All days":
+    # customer-level mask (customer + prediction + risk filters)
+    cmask = np.ones(len(ids), bool)
+    if cust_sel != "All":
+        cmask &= (np.arange(len(ids)) == ids.index(cust_sel))
+    if have_pred and pred_sel != "All":
+        cmask &= (pred == (1 if pred_sel == "Theft" else 0))
+    if have_pred and risk_sel != "All":
+        cmask &= (alarms == risk_sel)
+    csel = np.where(cmask)[0]
+    if len(csel) == 0:
+        callout("info", "No customers match the selected filters."); return
+
+    # day-level mask (month + day filters)
+    dmask = np.ones(n_days, bool)
+    if month_sel != "All":
+        m = int(month_sel.split()[-1]); dmask[:] = False
+        dmask[(m - 1) * 30: min(m * 30, n_days)] = True
+    if day_sel != "All":
         d = int(day_sel.split()[-1]) - 1
-        dm = np.zeros(n_days, dtype=bool)
-        if 0 <= d < n_days: dm[d] = True
-        day_mask = day_mask & dm
-    sel_days = np.where(day_mask)[0]
-    if len(sel_days) == 0: sel_days = np.arange(n_days)
+        dd = np.zeros(n_days, bool)
+        if 0 <= d < n_days: dd[d] = True
+        dmask &= dd
+    dsel = np.where(dmask)[0]
+    if len(dsel) == 0: dsel = np.arange(n_days)
 
-    sub = readings[np.ix_(cust_idx, sel_days)]                 # (customers, days)
-    day_labels = [str(info["reading_cols"][d]) for d in sel_days]
+    sub = readings[np.ix_(csel, dsel)]                    # (customers, days) — filtered
+    sub_labels = [day_cols[d] for d in dsel]
 
-    # ── KPI cards ──
+    # ── Section 3 — KPI cards ──
+    n_total = len(csel)
+    n_theft = int(pred[csel].sum()) if have_pred else 0
+    n_normal = n_total - n_theft
     c = st.columns(3)
-    with c[0]: kpi("Total electricity", f"{float(sub.sum()):,.0f}", "kWh in selection", "#2563eb", "⚡")
-    if status is not None:
-        sel_status = [status[ids[i]] for i in cust_idx if ids[i] in status]
-        theft = sum(1 for s in sel_status if s == "Theft"); normal = len(sel_status) - theft
-        with c[1]: kpi("Theft", f"{theft:,}", "customers", "#ef4444", "🔴")
-        with c[2]: kpi("Normal", f"{normal:,}", "customers", "#22c55e", "🟢")
-    else:
-        with c[1]: kpi("Customers", f"{len(cust_idx):,}", "in selection", "#2563eb", "👥")
-        with c[2]: kpi("Days", f"{len(sel_days):,}", "in selection", "#7c3aed", "📅")
+    with c[0]: kpi("Total customers", f"{n_total:,}", "in view", "#2563eb", "👥")
+    with c[1]: kpi("Normal", f"{n_normal:,}", "predicted", "#16a34a", "🟢")
+    with c[2]: kpi("Theft", f"{n_theft:,}", "predicted", "#dc2626", "🔴")
+    c = st.columns(3)
+    with c[0]: kpi("Theft rate", f"{(n_theft / max(n_total,1) * 100):.1f}%", "of customers", "#f59e0b", "📊")
+    with c[1]: kpi("Avg risk score", f"{np.nanmean(risk[csel]):.1f}" if have_pred else "—", "0–100", "#7c3aed", "🎯")
+    with c[2]: kpi("Avg daily consumption", f"{sub.mean():,.1f}", "kWh / day", "#0891b2", "⚡")
 
-    # ── Charts ──
-    left, rightc = st.columns(2)
-    with left:
-        if status is not None:
-            sel_status = [status[ids[i]] for i in cust_idx if ids[i] in status]
-            n_normal = sum(1 for s in sel_status if s == "Normal")
-            n_theft = len(sel_status) - n_normal
-            fig = go.Figure(go.Bar(x=["Normal", "Theft"], y=[n_normal, n_theft],
-                                   marker_color=["#22c55e", "#ef4444"],
-                                   text=[n_normal, n_theft], textposition="outside"))
-            st.plotly_chart(style_fig(fig, title="Theft vs Normal"), use_container_width=True)
-        else:
-            callout("info", f"Predictions need exactly {E.seq_len} readings — this file has "
-                            f"{n_days}. Showing usage charts only.")
-    with rightc:
-        daily_total = sub.sum(axis=0)
-        fig = go.Figure(go.Scatter(x=day_labels, y=daily_total, mode="lines+markers",
+    # ── Section 4 — charts ──
+    g = st.columns(2)
+    with g[0]:
+        fig = go.Figure(go.Scatter(x=sub_labels, y=sub.sum(axis=0), mode="lines",
                                    line=dict(color="#2563eb", width=2),
-                                   fill="tozeroy", fillcolor="rgba(37,99,235,.12)"))
-        st.plotly_chart(style_fig(fig, title="Total daily electricity usage"), use_container_width=True)
+                                   fill="tozeroy", fillcolor="rgba(37,99,235,.10)"))
+        st.plotly_chart(style_fig(fig, title="Daily electricity consumption"), use_container_width=True)
+    with g[1]:
+        fig = go.Figure(go.Bar(x=sub_labels, y=sub.mean(axis=0), marker_color="#7c3aed"))
+        st.plotly_chart(style_fig(fig, title="Average consumption per day"), use_container_width=True)
+    g = st.columns(2)
+    with g[0]:
+        fig = go.Figure(go.Bar(x=["Normal", "Theft"], y=[n_normal, n_theft],
+                               marker_color=["#16a34a", "#dc2626"],
+                               text=[n_normal, n_theft], textposition="outside"))
+        st.plotly_chart(style_fig(fig, title="Normal vs Theft"), use_container_width=True)
+    with g[1]:
+        # monthly usage (30-day blocks) across filtered customers
+        monthly = readings[csel].sum(axis=0)
+        mvals = [float(monthly[(m - 1) * 30: min(m * 30, n_days)].sum()) for m in range(1, n_months + 1)]
+        fig = go.Figure(go.Scatter(x=[f"M{m}" for m in range(1, n_months + 1)], y=mvals,
+                                   mode="lines+markers", line=dict(color="#0891b2", width=2)))
+        st.plotly_chart(style_fig(fig, title="Monthly electricity usage"), use_container_width=True)
+    if have_pred:
+        g = st.columns(2)
+        with g[0]:
+            fig = px.histogram(pd.DataFrame({"risk": risk[csel]}), x="risk", nbins=20,
+                               color_discrete_sequence=["#2563eb"])
+            st.plotly_chart(style_fig(fig, title="Risk distribution"), use_container_width=True)
+        with g[1]:
+            ac = pd.Series(alarms[csel]).value_counts().reindex(["Critical", "High", "Medium", "Low"]).fillna(0)
+            fig = go.Figure(go.Pie(labels=ac.index.tolist(), values=ac.values, hole=.55,
+                                   marker_colors=["#dc2626", "#f59e0b", "#eab308", "#16a34a"]))
+            st.plotly_chart(style_fig(fig, title="Risk categories"), use_container_width=True)
 
-    daily_avg = sub.mean(axis=0)
-    fig = go.Figure(go.Bar(x=day_labels, y=daily_avg, marker_color="#7c3aed"))
-    st.plotly_chart(style_fig(fig, height=360, title="Average electricity usage per day"),
-                    use_container_width=True)
+    # ── Sections 5 & 6 — Top 10 highest / lowest risk ──
+    if have_pred:
+        tbl = pd.DataFrame({"Customer ID": [ids[i] for i in csel],
+                            "Risk Score": risk[csel],
+                            "Probability": [f"{probs[i]*100:.1f}%" for i in csel],
+                            "Prediction": ["Theft" if pred[i] else "Normal" for i in csel]})
+        t = st.columns(2)
+        with t[0]:
+            st.markdown("##### 🔺 Top 10 highest risk")
+            st.dataframe(tbl.sort_values("Risk Score", ascending=False).head(10),
+                         use_container_width=True, hide_index=True)
+        with t[1]:
+            st.markdown("##### 🔻 Top 10 lowest risk")
+            st.dataframe(tbl.sort_values("Risk Score", ascending=True).head(10),
+                         use_container_width=True, hide_index=True)
+
+        # ── Section 9 — alarm summary ──
+        st.markdown("##### 🚨 Alarm summary")
+        counts_a = pd.Series(alarms[csel]).value_counts()
+        a = st.columns(4)
+        for col, lvl, clr, ic in zip(a, ["Critical", "High", "Medium", "Low"],
+                                     ["#dc2626", "#f59e0b", "#eab308", "#16a34a"], ["⛔", "⚠️", "🟡", "✅"]):
+            with col: kpi(lvl, f"{int(counts_a.get(lvl, 0)):,}", "customers", clr, ic)
+
+    # ── Section 7 — customer consumption explorer ──
+    st.markdown("##### 🔎 Customer consumption explorer")
+    exp_sel = st.selectbox("Select a customer to view their consumption sequence",
+                           ["—"] + [ids[i] for i in csel], key="dash_explorer")
+    if exp_sel != "—":
+        ci = ids.index(exp_sel)
+        seq = readings[ci]
+        fig = go.Figure(go.Scatter(x=day_cols, y=seq, mode="lines",
+                                   line=dict(color="#2563eb", width=2),
+                                   fill="tozeroy", fillcolor="rgba(37,99,235,.10)"))
+        st.plotly_chart(style_fig(fig, height=300, title=f"{exp_sel} — consumption sequence"),
+                        use_container_width=True)
+        # ── Section 8 — per-timestep importance (XAI), opt-in, hidden if unavailable ──
+        if st.checkbox("Show per-timestep importance (XAI)", value=False, key="dash_xai"):
+            try:
+                ex = shap_or_ig(seq)
+            except Exception:
+                ex = None
+            if ex and ex.get("timestep_importance"):
+                imp = ex["timestep_importance"]
+                fig = go.Figure(go.Bar(x=list(range(1, len(imp) + 1)), y=imp, marker_color="#7c3aed"))
+                st.plotly_chart(style_fig(fig, height=260, title=f"Per-timestep importance · {ex['method']}"),
+                                use_container_width=True)
+            else:
+                callout("info", "Explainability is unavailable for this input.")
+
+    # ── Section 10 — batch analytics ──
+    if have_pred:
+        st.markdown("##### 📦 Batch analytics")
+        monthly_all = [float(readings[csel][:, (m - 1) * 30: min(m * 30, n_days)].sum())
+                       for m in range(1, n_months + 1)]
+        day_totals = readings[csel].sum(axis=0)
+        hi = csel[int(np.argmax(total_cons[csel]))]
+        lo = csel[int(np.argmin(total_cons[csel]))]
+        b = st.columns(3)
+        with b[0]: kpi("Avg probability", f"{np.nanmean(probs[csel])*100:.1f}%", "theft likelihood", "#2563eb", "📈")
+        with b[1]: kpi("Avg consumption", f"{readings[csel].mean():,.1f}", "kWh / day", "#0891b2", "⚡")
+        with b[2]: kpi("Most active month", f"M{int(np.argmax(monthly_all)) + 1}", "highest usage", "#7c3aed", "📅")
+        b = st.columns(3)
+        with b[0]: kpi("Highest consumer", str(ids[hi]), f"{total_cons[hi]:,.0f} kWh", "#16a34a", "🔼")
+        with b[1]: kpi("Lowest consumer", str(ids[lo]), f"{total_cons[lo]:,.0f} kWh", "#dc2626", "🔽")
+        with b[2]: kpi("Most suspicious day", day_cols[int(np.argmin(day_totals))], "lowest usage", "#f59e0b", "🕵️")
 
 
 def page_manual():
@@ -1762,19 +1864,19 @@ def page_manual():
             with right:
                 callout("warn", "Enter at least 2 numeric readings.")
             return
-        # STRICT fixed-length guard (validation layer only). The (None, T, 1) model
-        # was trained on exactly T chronological readings; user input is NEVER
-        # resized/padded/truncated/shifted. Only variable-length models (T is None)
-        # accept any length. The prediction engine below is untouched.
+        # The CNN-LSTM accepts variable length, so any count is ACCEPTED. When it
+        # differs from the trained length the sequence is adapted (engine untouched);
+        # accuracy is only guaranteed at exactly T readings — we warn, never block.
+        strat_use = strat
         if T is not None and len(raw) != T:
             with right:
-                extra = "<br>No automatic resizing is allowed." if len(raw) > T else ""
-                callout("err", f"<b>Invalid input.</b><br>Model expects exactly <b>{T}</b> "
-                               f"readings.<br>Received <b>{len(raw)}</b> readings.{extra}")
-            return
+                callout("warn", f"Entered <b>{len(raw)}</b> readings; model was trained on "
+                                f"<b>{T}</b>. The sequence will be adapted to {T} — accuracy "
+                                f"is only guaranteed at exactly {T}.")
+            strat_use = strategy_selector("m_strat_adapt")
         with right:
             with st.spinner("⚡ Running model.predict()…"):
-                res = predict_one(raw, strat, thr)
+                res = predict_one(raw, strat_use, thr)
             save_manual(customer_id=cid, **{k: res[k] for k in
                 ("probability", "prediction", "confidence", "risk_score", "status")},
                 readings=list(map(float, raw)), threshold=thr, model_name=res["model_name"])
@@ -1903,13 +2005,16 @@ def page_batch():
                       f"exactly — data sent as-is, no resizing.")
         allow_resize, strat = True, "last_n"
     else:
-        # STRICT: fixed-length model + length mismatch => hard abort. User data is
-        # NEVER resized/padded/truncated/interpolated (validation layer only).
-        callout("err", f"<b>Incompatible dataset.</b><br><br>Model expects: <b>{T}</b> readings"
-                       f"<br>Uploaded: <b>{info['n_readings']}</b> readings<br><br>"
-                       f"Prediction aborted. No automatic resizing is allowed.")
-        allow_resize, strat = False, "last_n"
-        integrity_note = "✗ Incompatible dataset — prediction aborted (no resize)."
+        # Length differs from training. The CNN-LSTM accepts variable length, so we
+        # ACCEPT the upload and adapt the sequence to the trained length via an
+        # explicit, user-chosen strategy (never silent). Accuracy is only
+        # guaranteed at exactly T readings.
+        callout("warn", f"<b>Length differs from training.</b><br>Model was trained on <b>{T}</b> "
+                        f"readings; this file has <b>{info['n_readings']}</b>. The sequence will be "
+                        f"adapted to <b>{T}</b> — accuracy is only guaranteed at exactly {T}.")
+        strat = strategy_selector("b_strat")
+        allow_resize = True
+        integrity_note = f"⚠ Adapted to {T} via {STRATEGY_LABELS[strat]} (accuracy not guaranteed)."
     # Suggest adjusted threshold for data distribution mismatch
     thr_default = ss.threshold
     thr_help = f"Config default for this model: {config_threshold():.2f}"
@@ -2353,12 +2458,15 @@ def page_user_predict():
     render_dataset_preview(df, info)
     for kind, msg in validate_dataset_report(df, info):
         callout(kind, msg)
-    # Compatibility is enforced WITHOUT exposing model internals.
+    # Any length is accepted (the model adapts). Only truly empty files are rejected.
     T = E.seq_len
-    if not (T is None or info["n_readings"] == T) or info["n_readings"] < 2:
-        callout("err", "This dataset is not compatible with the current system configuration. "
-                       "Please contact an administrator.", "Incompatible dataset")
+    if info["n_readings"] < 2:
+        callout("err", "This dataset has no usable readings. Please contact an administrator.",
+                "Incompatible dataset")
         return
+    if T is not None and info["n_readings"] != T:
+        callout("warn", f"This dataset has {info['n_readings']} readings; the system is tuned "
+                        f"for {T}. Results are shown but accuracy is best at exactly {T}.")
     if not st.button("Run prediction", type="primary", use_container_width=True):
         return
     with st.spinner("Analysing customers…"):
