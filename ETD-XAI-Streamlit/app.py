@@ -1359,6 +1359,7 @@ if not is_loaded():
 ss = st.session_state
 ss.setdefault("theme", get_setting("theme", "dark"))
 ss.setdefault("bg_custom", get_setting("bg_custom", None))
+ss.setdefault("accent_custom", get_setting("accent_custom", None))
 # v3.0: threshold defaults from model_config.json (per active model), not 0.5.
 _cfg_thr = config_threshold() if is_loaded() else 0.5
 ss.setdefault("threshold", float(get_setting("threshold", _cfg_thr)))
@@ -1396,7 +1397,8 @@ def _palette() -> dict:
     A custom background (ss.bg_custom) derives readable text/card/border tokens
     automatically from the background's luminance, so text stays clearly visible
     on any chosen background."""
-    prim, ok, warn, err = "#2563eb", "#16a34a", "#d97706", "#dc2626"
+    prim = ss.get("accent_custom") or "#2563eb"
+    ok, warn, err = "#16a34a", "#d97706", "#dc2626"
     custom = ss.get("bg_custom")
     if custom:
         dark = _hex_luminance(custom) < 0.5
@@ -2357,6 +2359,15 @@ def page_settings():
     if ss.bg_custom:
         _mode = "dark" if _bg_is_dark() else "light"
         st.caption(f"Active custom background `{ss.bg_custom}` · auto text mode: **{_mode}**")
+
+    st.markdown("#### Accent colour")
+    st.caption("Primary colour for KPI accents, links and charts.")
+    ac = st.columns([2, 1, 1])
+    acc = ac[0].color_picker("Accent colour", value=(ss.accent_custom or "#2563eb"), key="accent_pick")
+    if ac[1].button("Apply", use_container_width=True, key="accent_apply"):
+        ss.accent_custom = acc; set_setting("accent_custom", acc); st.rerun()
+    if ac[2].button("Reset", use_container_width=True, key="accent_reset"):
+        ss.accent_custom = None; set_setting("accent_custom", None); st.rerun()
 
     st.divider()
     st.markdown("### Verification Status")
