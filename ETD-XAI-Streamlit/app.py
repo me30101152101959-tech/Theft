@@ -1702,6 +1702,23 @@ def _alarm_level(risk):
             else "Medium" if risk >= 40 else "Low")
 
 
+def _risk_sheet(title, sheet_df):
+    """Drill-down 'sheet' of customers — a modal dialog when the Streamlit
+    version supports st.dialog, else an inline bordered panel. Read-only."""
+    def _body():
+        st.dataframe(sheet_df, use_container_width=True, hide_index=True, height=340)
+        st.download_button("⬇️ Export CSV", to_csv(sheet_df), "risk_customers.csv", "text/csv")
+    if hasattr(st, "dialog"):
+        @st.dialog(title)
+        def _panel():
+            _body()
+        _panel()
+    else:
+        with st.container(border=True):
+            st.markdown(f"**{title}**")
+            _body()
+
+
 def page_dashboard():
     """Enterprise analytics dashboard (admin + user). READ-ONLY: it never mutates
     the dataframe, reading columns, model, scaler, threshold or predictions. The
@@ -1730,6 +1747,15 @@ def page_dashboard():
     pred = (probs >= thr).astype(int) if have_pred else np.zeros(len(ids), int)
     alarms = np.array([_alarm_level(r) for r in risk]) if have_pred else np.array(["—"] * len(ids))
     total_cons = readings.sum(axis=1)
+    # Estimated stolen electricity (read-only heuristic, not part of the model):
+    # how much LESS a customer consumed than the average legitimate (Normal-
+    # predicted) daily baseline, summed over the period. Clipped at 0.
+    daily_mean = readings.mean(axis=1)
+    if have_pred and (pred == 0).any():
+        baseline_daily = float(daily_mean[pred == 0].mean())
+    else:
+        baseline_daily = float(daily_mean.mean())
+    est_stolen = np.clip(baseline_daily - daily_mean, 0, None) * readings.shape[1]
 
     # ── Section 2 — filters ──
     n_months = (n_days + 29) // 30
@@ -1789,7 +1815,9 @@ def page_dashboard():
                                    fill="tozeroy", fillcolor="rgba(37,99,235,.10)"))
         st.plotly_chart(style_fig(fig, title="Daily electricity consumption"), use_container_width=True)
     with g[1]:
-        fig = go.Figure(go.Bar(x=sub_labels, y=sub.mean(axis=0), marker_color="#7c3aed"))
+        fig = go.Figure(go.Scatter(x=sub_labels, y=sub.mean(axis=0), mode="lines",
+                                   line=dict(color="#7c3aed", width=2),
+                                   fill="tozeroy", fillcolor="rgba(124,58,237,.10)"))
         st.plotly_chart(style_fig(fig, title="Average consumption per day"), use_container_width=True)
     g = st.columns(2)
     with g[0]:
@@ -1811,10 +1839,34 @@ def page_dashboard():
                                color_discrete_sequence=["#2563eb"])
             st.plotly_chart(style_fig(fig, title="Risk distribution"), use_container_width=True)
         with g[1]:
-            ac = pd.Series(alarms[csel]).value_counts().reindex(["Critical", "High", "Medium", "Low"]).fillna(0)
-            fig = go.Figure(go.Pie(labels=ac.index.tolist(), values=ac.values, hole=.55,
-                                   marker_colors=["#dc2626", "#f59e0b", "#eab308", "#16a34a"]))
-            st.plotly_chart(style_fig(fig, title="Risk categories"), use_container_width=True)
+            _cats = ["Critical", "High", "Medium", "Low"]
+            ac = pd.Series(alarms[csel]).value_counts().reindex(_cats).fillna(0)
+            fig = go.Figure(go.Bar(x=_cats, y=ac.values.astype(int),
+                                   marker_color=["#dc2626", "#f59e0b", "#eab308", "#16a34a"],
+                                   text=ac.values.astype(int), textposition="outside"))
+            ev = st.plotly_chart(style_fig(fig, title="Risk categories — click a bar for details"),
+                                 use_container_width=True, on_select="rerun", key="risk_cat_click")
+        # Drill-down: clicking Critical/High/Medium/Low opens a sheet of those
+        # customers with their estimated stolen electricity.
+        sel_cat = None
+        try:
+            _pts = ev["selection"]["points"] if ev else None
+            if _pts:
+                sel_cat = _pts[0].get("x")
+        except Exception:
+            sel_cat = None
+        if sel_cat in _cats:
+            members = csel[np.array([alarms[i] == sel_cat for i in csel])]
+            if len(members):
+                sheet = pd.DataFrame({
+                    "Customer ID": [ids[i] for i in members],
+                    "Risk Score": risk[members],
+                    "Probability": [f"{probs[i]*100:.1f}%" for i in members],
+                    "Est. stolen (kWh)": np.round(est_stolen[members], 1),
+                    "Total consumption (kWh)": np.round(total_cons[members], 1),
+                }).sort_values("Risk Score", ascending=False)
+                _risk_sheet(f"{sel_cat} risk — {len(members)} customers · "
+                            f"est. stolen {est_stolen[members].sum():,.0f} kWh", sheet)
 
     # ── Sections 5 & 6 — Top 10 highest / lowest risk ──
     if have_pred:
