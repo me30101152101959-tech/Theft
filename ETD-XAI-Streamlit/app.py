@@ -1358,6 +1358,7 @@ if not is_loaded():
 
 ss = st.session_state
 ss.setdefault("theme", get_setting("theme", "dark"))
+ss.setdefault("bg_custom", get_setting("bg_custom", None))
 # v3.0: threshold defaults from model_config.json (per active model), not 0.5.
 _cfg_thr = config_threshold() if is_loaded() else 0.5
 ss.setdefault("threshold", float(get_setting("threshold", _cfg_thr)))
@@ -1366,11 +1367,48 @@ ss.setdefault("chat", [])
 ss.setdefault("manual_text", "")
 
 
+def _hex_luminance(hexc: str) -> float:
+    """Relative luminance (0=black … 1=white) of a #RRGGBB colour (WCAG)."""
+    h = str(hexc).lstrip("#")
+    if len(h) != 6:
+        return 0.5
+    r, g, b = (int(h[i:i + 2], 16) / 255 for i in (0, 2, 4))
+    lin = lambda c: c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4
+    return 0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b)
+
+
+def _mix(hexc: str, target: str, amt: float) -> str:
+    """Blend hexc toward target (#ffffff/#000000) by amt (0..1)."""
+    h = str(hexc).lstrip("#"); t = target.lstrip("#")
+    c1 = [int(h[i:i + 2], 16) for i in (0, 2, 4)]
+    c2 = [int(t[i:i + 2], 16) for i in (0, 2, 4)]
+    m = [round(a + (b - a) * amt) for a, b in zip(c1, c2)]
+    return "#%02x%02x%02x" % tuple(m)
+
+
+def _bg_is_dark() -> bool:
+    custom = ss.get("bg_custom")
+    return _hex_luminance(custom) < 0.5 if custom else (ss.theme == "dark")
+
+
 def _palette() -> dict:
     """Enterprise theme tokens (few colors) — single source of truth for the UI.
-    Light = Stripe/Notion white; Dark = Grafana/Datadog slate."""
+    A custom background (ss.bg_custom) derives readable text/card/border tokens
+    automatically from the background's luminance, so text stays clearly visible
+    on any chosen background."""
     prim, ok, warn, err = "#2563eb", "#16a34a", "#d97706", "#dc2626"
-    if ss.theme == "dark":
+    custom = ss.get("bg_custom")
+    if custom:
+        dark = _hex_luminance(custom) < 0.5
+        toward = "#ffffff" if dark else "#000000"
+        base = dict(
+            bg=custom,
+            card=_mix(custom, toward, 0.06), card2=_mix(custom, toward, 0.10),
+            text=("#f5f7fb" if dark else "#14181f"),
+            sub=("rgba(245,247,251,.66)" if dark else "rgba(20,24,31,.62)"),
+            border=("rgba(255,255,255,.16)" if dark else "rgba(0,0,0,.12)"),
+            grid=("rgba(255,255,255,.06)" if dark else "rgba(0,0,0,.06)"))
+    elif ss.theme == "dark":
         base = dict(bg="#0f1420", card="#171d2b", card2="#1e2636", text="#e6ebf4",
                     sub="#9aa7bd", border="#2a3446", grid="rgba(255,255,255,.05)")
     else:
@@ -1478,7 +1516,8 @@ TMPL = "plotly_dark" if ss.theme == "dark" else "plotly_white"
 def style_fig(fig, height=320, title=None):
     """Consistent, restrained Plotly styling across the whole app."""
     p = _palette()
-    fig.update_layout(template=TMPL, height=height,
+    tmpl = "plotly_dark" if _bg_is_dark() else "plotly_white"
+    fig.update_layout(template=tmpl, height=height,
                       title=dict(text=title, font=dict(size=13, family="Inter")) if title else None,
                       margin=dict(t=38 if title else 12, b=10, l=10, r=10),
                       paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
@@ -1623,19 +1662,37 @@ def parse_readings(text):
 # SECTION 10 — Pages
 # ═════════════════════════════════════════════════════════════════════════════
 def _dashboard_source():
-    """Resolve the working dataset for the dashboard: an in-page upload wins,
-    else the saved active dataset, else the bundled sample. Returns a file-ish
-    object/path or None."""
+    """Resolve the working dataset for the dashboard as (raw_bytes, name).
+    An in-page upload wins, else the saved active dataset, else the bundled
+    sample. Returning bytes lets the heavy work be cached by content."""
     up = st.file_uploader("Upload a dataset (CSV/Excel) — or leave empty to use the saved dataset",
                           type=["csv", "xlsx", "xls"], key="dash_up")
     if up is not None:
-        return up
+        return up.getvalue(), up.name
     saved = get_setting("active_dataset_path")
-    if saved and Path(saved).exists():
-        return saved
-    if SAMPLE_DATASET.exists():
-        return str(SAMPLE_DATASET)
-    return None
+    p = saved if (saved and Path(saved).exists()) else (
+        str(SAMPLE_DATASET) if SAMPLE_DATASET.exists() else None)
+    if p is None:
+        return None, None
+    return Path(p).read_bytes(), Path(p).name
+
+
+@st.cache_data(show_spinner="Loading dashboard…", max_entries=4)
+def _dashboard_bundle(raw: bytes, name: str, thr: float, model_name: str):
+    """Read + inspect + build matrix + score ONCE per (file, threshold, model).
+    Cached so changing a filter does NOT re-run model.predict(). model_name is
+    part of the key so switching the active model invalidates the cache."""
+    buf = io.BytesIO(raw)
+    df = pd.read_excel(buf) if str(name).lower().endswith((".xlsx", ".xls")) else pd.read_csv(buf)
+    info = inspect(df)
+    readings, ids, _flags = build_matrix(df, info)
+    probs = None
+    try:
+        res = run_batch(df, info, "last_n", thr)
+        probs = np.array([r["probability"] for r in res["rows"]], dtype=float)
+    except Exception:
+        probs = None
+    return df, info, readings, ids, probs
 
 
 def _alarm_level(risk):
@@ -1650,30 +1707,22 @@ def page_dashboard():
     re-detects columns. Predictions come from the existing run_batch() only."""
     # ── Section 1 — header ──
     hero("Electricity Theft Analytics", "Enterprise Monitoring Dashboard")
-    src = _dashboard_source()
-    if src is None:
+    raw, name = _dashboard_source()
+    if raw is None:
         callout("info", "No dataset available. Upload a file above to view the dashboard.")
         return
     try:
-        df = read_table(src)
+        df, info, readings, ids, probs = _dashboard_bundle(raw, name, config_threshold(), E.name)
     except Exception as e:
         callout("err", f"Could not read file: {e}"); return
-    info = inspect(df)                                    # single source of truth
     if info["n_readings"] < 2:
         callout("err", "No usable reading columns found (need ≥ 2 numeric)."); return
-    readings, ids, _flags = build_matrix(df, info)        # readings uses info["reading_cols"]
     n_days = readings.shape[1]
     day_cols = [str(c) for c in info["reading_cols"]]
 
-    # Predictions via the existing engine only (read-only; run_batch adapts length).
-    probs = np.full(len(ids), np.nan)
-    have_pred = False
-    try:
-        res = run_batch(df, info, "last_n", config_threshold())
-        probs = np.array([r["probability"] for r in res["rows"]], dtype=float)
-        have_pred = True
-    except Exception:
-        have_pred = False
+    have_pred = probs is not None
+    if not have_pred:
+        probs = np.full(len(ids), np.nan)
     risk = np.round(probs * 100, 1)
     thr = config_threshold()
     pred = (probs >= thr).astype(int) if have_pred else np.zeros(len(ids), int)
@@ -2289,9 +2338,25 @@ def page_settings():
         ss.threshold = thr; set_setting("threshold", thr); st.toast(f"Threshold → {thr:.2f}")
     t1, t2 = st.columns(2)
     if t1.button("🌙 Dark theme", use_container_width=True):
-        ss.theme = "dark"; set_setting("theme", "dark"); st.rerun()
+        ss.theme = "dark"; ss.bg_custom = None
+        set_setting("theme", "dark"); set_setting("bg_custom", None); st.rerun()
     if t2.button("☀️ Light theme", use_container_width=True):
-        ss.theme = "light"; set_setting("theme", "light"); st.rerun()
+        ss.theme = "light"; ss.bg_custom = None
+        set_setting("theme", "light"); set_setting("bg_custom", None); st.rerun()
+
+    st.markdown("#### Custom background colour")
+    st.caption("Pick any background — text, cards and charts recolour automatically for "
+               "clear contrast (light text on dark backgrounds, dark text on light).")
+    cc = st.columns([2, 1, 1])
+    picked = cc[0].color_picker("Background colour",
+                                value=(ss.bg_custom or (_palette()["bg"])), key="bg_pick")
+    if cc[1].button("Apply", use_container_width=True):
+        ss.bg_custom = picked; set_setting("bg_custom", picked); st.rerun()
+    if cc[2].button("Reset", use_container_width=True):
+        ss.bg_custom = None; set_setting("bg_custom", None); st.rerun()
+    if ss.bg_custom:
+        _mode = "dark" if _bg_is_dark() else "light"
+        st.caption(f"Active custom background `{ss.bg_custom}` · auto text mode: **{_mode}**")
 
     st.divider()
     st.markdown("### Verification Status")
