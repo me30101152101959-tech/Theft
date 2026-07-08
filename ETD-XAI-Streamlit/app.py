@@ -1622,70 +1622,113 @@ def parse_readings(text):
 # ═════════════════════════════════════════════════════════════════════════════
 # SECTION 10 — Pages
 # ═════════════════════════════════════════════════════════════════════════════
+def _dashboard_source():
+    """Resolve the working dataset for the dashboard: an in-page upload wins,
+    else the saved active dataset, else the bundled sample. Returns a file-ish
+    object/path or None."""
+    up = st.file_uploader("Upload a dataset (CSV/Excel) — or leave empty to use the saved dataset",
+                          type=["csv", "xlsx", "xls"], key="dash_up")
+    if up is not None:
+        return up
+    saved = get_setting("active_dataset_path")
+    if saved and Path(saved).exists():
+        return saved
+    if SAMPLE_DATASET.exists():
+        return str(SAMPLE_DATASET)
+    return None
+
+
 def page_dashboard():
-    hero("📊 Executive Dashboard", "Electricity Theft Detection — CNN-LSTM Explainable AI")
-    info = model_info()
-    uid = latest_upload_id()
-    up = get_upload(uid) if uid else None
-    c = st.columns(4)
-    with c[0]: kpi("Model Status", "Loaded" if info.get("loaded") else "Not Loaded",
-                   info.get("name", ""), "#22c55e" if info.get("loaded") else "#ef4444",
-                   "🧠" if info.get("loaded") else "⚠️")
-    with c[1]: kpi("Engine", "TF / Keras", f"v{info.get('tf_version', '—')}" if info.get("loaded") else "",
-                   "#2563eb", "⚙️")
-    with c[2]: kpi("Compute", "GPU" if has_gpu() else "CPU", "Inference device", "#7c3aed", "🖥️")
-    with c[3]: kpi("Predictions", f"{counts()['predictions']:,}", "stored in SQLite", "#06b6d4", "🗃️")
-
-    if not up:
-        callout("info", "No dataset processed yet — open <b>📦 Batch Prediction</b> to score a dataset.")
+    """Charts-only dashboard (admin + user): theft/normal, daily usage line,
+    per-day usage column, with customer / month / day slicers. Day mapping is
+    POSITIONAL (column order = day 1..N) so it works with any column names —
+    the date headers do not need to be fixed."""
+    hero("📊 Dashboard", "Electricity usage & theft detection")
+    src = _dashboard_source()
+    if src is None:
+        callout("info", "No dataset available. Upload a file above to see the dashboard.")
         return
+    try:
+        df = read_table(src)
+    except Exception as e:
+        callout("err", f"Could not read file: {e}"); return
+    info = inspect(df)
+    if info["n_readings"] < 2:
+        callout("err", "No usable reading columns found (need ≥ 2 numeric)."); return
+    readings, ids, _flags = build_matrix(df, info)
+    n_days = readings.shape[1]
 
-    st.markdown("### 📈 Prediction Overview")
-    c = st.columns(4)
-    with c[0]: kpi("Total Customers", f"{up['total_rows']:,}", "in latest run", "#2563eb", "👥")
-    with c[1]: kpi("Normal", f"{up['normal_rows']:,}", "Class 0", "#22c55e", "🟢")
-    with c[2]: kpi("Theft", f"{up['theft_rows']:,}", "Class 1", "#ef4444", "🔴")
-    with c[3]: kpi("Theft Rate", f"{(up['theft_rate'] or 0) * 100:.1f}%", "of customers", "#f59e0b", "📊")
+    # Predictions (theft/normal) only when the length matches the model.
+    status = None
+    if E.seq_len is None or n_days == E.seq_len:
+        try:
+            res = run_batch(df, info, "last_n", config_threshold())
+            status = {r["customer_id"]: r["status"] for r in res["rows"]}
+        except Exception:
+            status = None
 
-    if up.get("accuracy") is not None:
-        st.markdown("### 🎯 Evaluation Metrics (vs ground-truth FLAG)")
-        c = st.columns(5)
-        icons = ["✅", "🎯", "🔁", "⚖️", "📐"]
-        for col, lbl, key, ic in zip(c, ["Accuracy", "Precision", "Recall", "F1", "ROC-AUC"],
-                                     ["accuracy", "precision_val", "recall_val", "f1_score", "roc_auc"], icons):
-            with col: kpi(lbl, f"{up[key]:.3f}" if up.get(key) is not None else "—", "", "#7c3aed", ic)
+    # ── Slicers: customer / month / day (positional) ──
+    n_months = (n_days + 29) // 30
+    f = st.columns(3)
+    cust_sel = f[0].selectbox("👤 Customer", ["All customers"] + ids, key="dash_cust")
+    month_sel = f[1].selectbox("📅 Month", ["All months"] + [f"Month {m}" for m in range(1, n_months + 1)],
+                               key="dash_month")
+    day_sel = f[2].selectbox("🗓️ Day", ["All days"] + [f"Day {d}" for d in range(1, n_days + 1)],
+                             key="dash_day")
 
-    df = predictions_df(uid)
-    if df.empty:
-        return
-    g = st.columns(2)
-    with g[0]:
-        fig = go.Figure(go.Pie(labels=["Normal", "Theft"],
-                               values=df["status"].value_counts().reindex(["Normal", "Theft"]).fillna(0).values,
-                               hole=.6, marker_colors=["#22c55e", "#ef4444"],
-                               textfont=dict(size=14)))
-        st.plotly_chart(style_fig(fig, title="Prediction Distribution"), use_container_width=True)
-    with g[1]:
-        fig = px.histogram(df, x="risk_score", nbins=25, color="status",
-                           color_discrete_map={"Normal": "#22c55e", "Theft": "#ef4444"})
-        st.plotly_chart(style_fig(fig, title="Risk Distribution"), use_container_width=True)
-    g = st.columns(2)
-    with g[0]:
-        fig = px.histogram(df, x="probability", nbins=30, color="status",
-                           color_discrete_map={"Normal": "#22c55e", "Theft": "#ef4444"})
-        st.plotly_chart(style_fig(fig, title="Probability Distribution"), use_container_width=True)
-    with g[1]:
-        cm = up.get("confusion_matrix")
-        if cm:
-            fig = px.imshow(cm, text_auto=True, color_continuous_scale="Purples",
-                            x=["Pred Normal", "Pred Theft"], y=["Actual Normal", "Actual Theft"])
-            st.plotly_chart(style_fig(fig, title="Confusion Matrix"), use_container_width=True)
+    cust_idx = np.arange(len(ids)) if cust_sel == "All customers" else np.array([ids.index(cust_sel)])
+    day_mask = np.ones(n_days, dtype=bool)
+    if month_sel != "All months":
+        m = int(month_sel.split()[-1]); day_mask[:] = False
+        day_mask[(m - 1) * 30: min(m * 30, n_days)] = True
+    if day_sel != "All days":
+        d = int(day_sel.split()[-1]) - 1
+        dm = np.zeros(n_days, dtype=bool)
+        if 0 <= d < n_days: dm[d] = True
+        day_mask = day_mask & dm
+    sel_days = np.where(day_mask)[0]
+    if len(sel_days) == 0: sel_days = np.arange(n_days)
+
+    sub = readings[np.ix_(cust_idx, sel_days)]                 # (customers, days)
+    day_labels = [str(info["reading_cols"][d]) for d in sel_days]
+
+    # ── KPI cards ──
+    c = st.columns(3)
+    with c[0]: kpi("Total electricity", f"{float(sub.sum()):,.0f}", "kWh in selection", "#2563eb", "⚡")
+    if status is not None:
+        sel_status = [status[ids[i]] for i in cust_idx if ids[i] in status]
+        theft = sum(1 for s in sel_status if s == "Theft"); normal = len(sel_status) - theft
+        with c[1]: kpi("Theft", f"{theft:,}", "customers", "#ef4444", "🔴")
+        with c[2]: kpi("Normal", f"{normal:,}", "customers", "#22c55e", "🟢")
+    else:
+        with c[1]: kpi("Customers", f"{len(cust_idx):,}", "in selection", "#2563eb", "👥")
+        with c[2]: kpi("Days", f"{len(sel_days):,}", "in selection", "#7c3aed", "📅")
+
+    # ── Charts ──
+    left, rightc = st.columns(2)
+    with left:
+        if status is not None:
+            sel_status = [status[ids[i]] for i in cust_idx if ids[i] in status]
+            n_normal = sum(1 for s in sel_status if s == "Normal")
+            n_theft = len(sel_status) - n_normal
+            fig = go.Figure(go.Bar(x=["Normal", "Theft"], y=[n_normal, n_theft],
+                                   marker_color=["#22c55e", "#ef4444"],
+                                   text=[n_normal, n_theft], textposition="outside"))
+            st.plotly_chart(style_fig(fig, title="Theft vs Normal"), use_container_width=True)
         else:
-            st.markdown("##### 🔝 Top 10 Highest-Risk")
-            st.dataframe(df.head(10)[["customer_id", "risk_score", "status"]],
-                        use_container_width=True, hide_index=True)
-    st.markdown("##### 🕒 Recent Predictions")
-    st.dataframe(df.head(20), use_container_width=True, hide_index=True)
+            callout("info", f"Predictions need exactly {E.seq_len} readings — this file has "
+                            f"{n_days}. Showing usage charts only.")
+    with rightc:
+        daily_total = sub.sum(axis=0)
+        fig = go.Figure(go.Scatter(x=day_labels, y=daily_total, mode="lines+markers",
+                                   line=dict(color="#2563eb", width=2),
+                                   fill="tozeroy", fillcolor="rgba(37,99,235,.12)"))
+        st.plotly_chart(style_fig(fig, title="Total daily electricity usage"), use_container_width=True)
+
+    daily_avg = sub.mean(axis=0)
+    fig = go.Figure(go.Bar(x=day_labels, y=daily_avg, marker_color="#7c3aed"))
+    st.plotly_chart(style_fig(fig, height=360, title="Average electricity usage per day"),
+                    use_container_width=True)
 
 
 def page_manual():
@@ -2375,7 +2418,7 @@ NAV_ADMIN = {
     "⚙️ Settings": ("System", _admin(page_settings)),
 }
 NAV_USER = {
-    "🏠 Home": ("Home", page_user_home),
+    "📊 Dashboard": ("Overview", page_dashboard),
     "⚡ Predict": ("Predict", page_user_predict),
     "📄 Reports": ("Reports", page_user_reports),
 }
